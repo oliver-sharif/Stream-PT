@@ -40,6 +40,21 @@ func NewKVCache(numLayers, maxTokens, numKVHeads, headDim int) *KVCache {
 type AttentionOptions struct {
 	Sinks         []float32
 	SlidingWindow int
+	Scratch       *AttentionScratch // Optional caller-owned scratch; not safe for concurrent use.
+}
+
+// AttentionScratch reuses softmax scores and SIMD reduction storage.
+type AttentionScratch struct {
+	scores, partials []float32
+}
+
+func (s *AttentionScratch) prepare(positions, lanes int) {
+	if len(s.scores) < positions {
+		s.scores = make([]float32, positions)
+	}
+	if len(s.partials) != lanes {
+		s.partials = make([]float32, lanes)
+	}
 }
 
 // ForwardAttention computes Grouped Query Attention (GQA) using the KV cache.
@@ -51,8 +66,14 @@ func ForwardAttention(
 	out []float32, // length = numHeads * headDim
 	options AttentionOptions,
 ) {
+	scratch := options.Scratch
+	if scratch == nil {
+		scratch = &AttentionScratch{}
+	}
+	var vector simd.Float32s
+	scratch.prepare(min(pos+1, cache.MaxPos), vector.Len())
 	forwardAttention(q, k, v, cache, layer, pos, numHeads, numKVHeads, headDim, out,
-		options, make([]float32, pos+1))
+		options, scratch.scores, scratch.partials)
 }
 
 func forwardAttention(
@@ -63,6 +84,7 @@ func forwardAttention(
 	out []float32,
 	options AttentionOptions,
 	scores []float32,
+	partials []float32,
 ) {
 	kvDim := numKVHeads * headDim
 	if pos < cache.MaxPos {
@@ -80,7 +102,6 @@ func forwardAttention(
 
 	var vec simd.Float32s
 	lanes := vec.Len()
-	partials := make([]float32, lanes)
 
 	for h := 0; h < numHeads; h++ {
 		kvHead := h / headRatio
@@ -129,16 +150,13 @@ func forwardAttention(
 			sumExp += expVal
 		}
 		invSum := float32(1.0) / sumExp
-		for p := startPos; p <= pos && p < cache.MaxPos; p++ {
-			scores[p] *= invSum
-		}
 
 		// Weighted sum of V
 		outHead := out[h*headDim : (h+1)*headDim]
 		clear(outHead)
 		for p := startPos; p <= pos && p < cache.MaxPos; p++ {
 			vHead := cache.Values[layer][p][kvHead*headDim : (kvHead+1)*headDim]
-			sVec := simd.BroadcastFloat32s(scores[p])
+			sVec := simd.BroadcastFloat32s(scores[p] * invSum)
 			for offset := 0; offset < headDim; offset += lanes {
 				end := min(offset+lanes, headDim)
 				if end-offset == lanes {

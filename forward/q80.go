@@ -4,12 +4,9 @@ package forward
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"math"
 	"runtime"
-	"simd"
-	"sync"
 
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
@@ -60,34 +57,21 @@ func MulQ80Into(
 	rowsPerWindow := int(min(windowBytes/uint64(rowBytes), uint64(output)))
 	workers := min(max(options.Workers, 1), runtime.GOMAXPROCS(0), rowsPerWindow)
 
+	pool := newQuantWorkers(workers, func(_ int, job quantRowJob) {
+		for row := job.begin; row < job.end; row++ {
+			if ctx.Err() != nil {
+				return
+			}
+			encoded := job.data[row*rowBytes : (row+1)*rowBytes]
+			y[job.firstRow+row] = dotQ80(encoded, x)
+		}
+	})
+	defer pool.close()
 	return reader.WithTensorChunks(tensor, uint64(rowsPerWindow)*uint64(rowBytes),
 		func(offset uint64, data []byte) error {
 			firstRow := int(offset / uint64(rowBytes))
 			rows := len(data) / rowBytes
-			compute := func(begin, end int) {
-				for row := begin; row < end; row++ {
-					if ctx.Err() != nil {
-						return
-					}
-					encoded := data[row*rowBytes : (row+1)*rowBytes]
-					y[firstRow+row] = dotQ80(encoded, x)
-				}
-			}
-			active := min(workers, rows)
-			if active == 1 {
-				compute(0, rows)
-			} else {
-				var wg sync.WaitGroup
-				for worker := 0; worker < active; worker++ {
-					begin, end := worker*rows/active, (worker+1)*rows/active
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						compute(begin, end)
-					}()
-				}
-				wg.Wait()
-			}
+			pool.run(data, firstRow, rows)
 			return ctx.Err()
 		})
 }
@@ -122,67 +106,48 @@ func MulQ80Argmax(
 	if windowBytes == 0 {
 		windowBytes = DefaultQ40WindowBytes
 	}
+	if windowBytes < uint64(rowBytes) {
+		return 0, 0, fmt.Errorf("window of %d bytes cannot accommodate a %d-byte row", windowBytes, rowBytes)
+	}
 	rowsPerWindow := int(min(windowBytes/uint64(rowBytes), uint64(output)))
 	workers := min(max(options.Workers, 1), runtime.GOMAXPROCS(0), rowsPerWindow)
 
 	bestToken = 0
 	bestLogit = float32(math.Inf(-1))
-	var mu sync.Mutex
+	type workerResult struct {
+		token int
+		logit float32
+	}
+	results := make([]workerResult, workers)
+	pool := newQuantWorkers(workers, func(worker int, job quantRowJob) {
+		local := workerResult{token: job.firstRow + job.begin, logit: float32(math.Inf(-1))}
+		for row := job.begin; row < job.end; row++ {
+			if ctx.Err() != nil {
+				break
+			}
+			encoded := job.data[row*rowBytes : (row+1)*rowBytes]
+			val := dotQ80(encoded, x)
+			if val > local.logit {
+				local = workerResult{token: job.firstRow + row, logit: val}
+			}
+		}
+		results[worker] = local
+	})
+	defer pool.close()
 
 	err = reader.WithTensorChunks(tensor, uint64(rowsPerWindow)*uint64(rowBytes),
 		func(offset uint64, data []byte) error {
 			firstRow := int(offset / uint64(rowBytes))
 			rows := len(data) / rowBytes
-
-			type workerResult struct {
-				token int
-				logit float32
-			}
-			results := make([]workerResult, workers)
-
-			compute := func(workerID, begin, end int) {
-				localBestToken := firstRow + begin
-				localBestLogit := float32(math.Inf(-1))
-				for row := begin; row < end; row++ {
-					if ctx.Err() != nil {
-						return
-					}
-					encoded := data[row*rowBytes : (row+1)*rowBytes]
-					val := dotQ80(encoded, x)
-					if val > localBestLogit {
-						localBestLogit = val
-						localBestToken = firstRow + row
-					}
-				}
-				results[workerID] = workerResult{token: localBestToken, logit: localBestLogit}
-			}
-
+			pool.run(data, firstRow, rows)
 			active := min(workers, rows)
-			if active == 1 {
-				compute(0, 0, rows)
-			} else {
-				var wg sync.WaitGroup
-				for worker := 0; worker < active; worker++ {
-					begin, end := worker*rows/active, (worker+1)*rows/active
-					wID := worker
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						compute(wID, begin, end)
-					}()
-				}
-				wg.Wait()
-			}
-
-			mu.Lock()
 			for i := 0; i < active; i++ {
-				if results[i].logit > bestLogit {
+				if results[i].logit > bestLogit ||
+					(results[i].logit == bestLogit && results[i].token < bestToken) {
 					bestLogit = results[i].logit
 					bestToken = results[i].token
 				}
 			}
-			mu.Unlock()
-
 			return ctx.Err()
 		})
 
@@ -200,57 +165,17 @@ func q80Shape(tensor ggufindex.Tensor) (input, output, rowBytes int, err error) 
 	if in == 0 || out == 0 || in%q80Elements != 0 {
 		return 0, 0, 0, fmt.Errorf("%q: invalid Q8_0 shape %v", tensor.Name, tensor.Shape)
 	}
+	maxInt := uint64(^uint(0) >> 1)
+	if in > maxInt || out > maxInt || in/q80Elements > maxInt/q80BlockBytes {
+		return 0, 0, 0, fmt.Errorf("%q: matrix dimensions exceed platform limits", tensor.Name)
+	}
 	bytes := in / q80Elements * q80BlockBytes
-	if tensor.Range.End <= tensor.Range.Start || tensor.Range.End-tensor.Range.Start != out*bytes {
+	if out > ^uint64(0)/bytes || tensor.Range.End <= tensor.Range.Start || tensor.Range.End-tensor.Range.Start != out*bytes {
 		return 0, 0, 0, fmt.Errorf("%q: invalid byte range", tensor.Name)
 	}
 	return int(in), int(out), int(bytes), nil
 }
 
 func dotQ80(row []byte, x []float32) float32 {
-	var accumulator simd.Float32s
-	lanes := accumulator.Len()
-	partials := make([]float32, lanes)
-
-	numBlocks := len(row) / q80BlockBytes
-	for block := 0; block < numBlocks; block++ {
-		begin := block * q80BlockBytes
-		encoded := row[begin : begin+q80BlockBytes]
-
-		scale := float16(binary.LittleEndian.Uint16(encoded[:2]))
-		qs := encoded[2:]
-
-		var weights [q80Elements]int32
-		for i := 0; i < q80Elements; i++ {
-			weights[i] = int32(int8(qs[i]))
-		}
-		vectorScale := simd.BroadcastFloat32s(scale)
-
-		input := x[block*q80Elements : (block+1)*q80Elements]
-		for offset := 0; offset < q80Elements; offset += lanes {
-			end := offset + lanes
-			if end > q80Elements {
-				end = q80Elements
-			}
-
-			var quant simd.Int32s
-			var v simd.Float32s
-			if end-offset == lanes {
-				quant = simd.LoadInt32s(weights[offset:end])
-				v = simd.LoadFloat32s(input[offset:end])
-			} else {
-				quant, _ = simd.LoadInt32sPart(weights[offset:end])
-				v, _ = simd.LoadFloat32sPart(input[offset:end])
-			}
-			w := quant.ConvertToFloat32().Mul(vectorScale)
-			accumulator = w.MulAdd(v, accumulator)
-		}
-	}
-
-	accumulator.Store(partials)
-	var result float32
-	for _, val := range partials {
-		result += val
-	}
-	return result
+	return quantDotQ80(row, x)
 }

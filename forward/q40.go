@@ -4,12 +4,9 @@ package forward
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"math"
 	"runtime"
-	"simd"
-	"sync"
 	"unsafe"
 
 	"Stream-PT/ggufindex"
@@ -109,40 +106,25 @@ func MulQ40BatchInto(ctx context.Context, reader *ggufmmap.Reader, tensor ggufin
 	rowsPerWindow := int(min(windowBytes/uint64(rowBytes), uint64(output)))
 	workers := min(max(options.Workers, 1), runtime.GOMAXPROCS(0), rowsPerWindow)
 
+	pool := newQuantWorkers(workers, func(_ int, job quantRowJob) {
+		for row := job.begin; row < job.end; row++ {
+			if ctx.Err() != nil {
+				return
+			}
+			encoded := job.data[row*rowBytes : (row+1)*rowBytes]
+			if batch == 1 {
+				y[job.firstRow+row] = dotQ40(encoded, x)
+			} else {
+				dotQ40Batch(encoded, x, y, input, output, job.firstRow+row, batch)
+			}
+		}
+	})
+	defer pool.close()
 	return reader.WithTensorChunks(tensor, uint64(rowsPerWindow)*uint64(rowBytes),
 		func(offset uint64, data []byte) error {
 			firstRow := int(offset / uint64(rowBytes))
 			rows := len(data) / rowBytes
-			compute := func(begin, end int) {
-				for row := begin; row < end; row++ {
-					if ctx.Err() != nil {
-						return
-					}
-					encoded := data[row*rowBytes : (row+1)*rowBytes]
-					if batch == 1 {
-						y[firstRow+row] = dotQ40(encoded, x)
-					} else {
-						dotQ40Batch(encoded, x, y, input, output, firstRow+row, batch)
-					}
-				}
-			}
-			// Contiguous row ranges avoid a channel operation per output element.
-			// All workers join before the current mmap window is unmapped.
-			active := min(workers, rows)
-			if active == 1 {
-				compute(0, rows)
-			} else {
-				var wg sync.WaitGroup
-				for worker := 0; worker < active; worker++ {
-					begin, end := worker*rows/active, (worker+1)*rows/active
-					wg.Add(1)
-					go func() {
-						defer wg.Done()
-						compute(begin, end)
-					}()
-				}
-				wg.Wait()
-			}
+			pool.run(data, firstRow, rows)
 			return ctx.Err()
 		})
 }
@@ -182,106 +164,13 @@ func float32Overlap(x, y []float32) bool {
 	return a < b+uintptr(len(y))*4 && b < a+uintptr(len(x))*4
 }
 
-// dotQ40 decodes only one 18-byte block into a small local buffer at a time.
+// dotQ40 decodes packed weights in SIMD registers where supported.
 func dotQ40(row []byte, x []float32) float32 {
-	var accumulator simd.Float32s
-	lanes := accumulator.Len()
-	partials := make([]float32, lanes)
-
-	for block := 0; block < len(row)/q40BlockBytes; block++ {
-		begin := block * q40BlockBytes
-		encoded := row[begin : begin+q40BlockBytes]
-
-		scale := float16(binary.LittleEndian.Uint16(encoded[:2]))
-		quantized := encoded[2:]
-
-		var weights [q40Elements]int32
-		for i, packed := range quantized {
-			// GGML Q4_0 stores the low 16 nibbles before the high 16 nibbles.
-			weights[i] = int32(packed&0x0f) - 8
-			weights[i+16] = int32(packed>>4) - 8
-		}
-		vectorScale := simd.BroadcastFloat32s(scale)
-
-		input := x[block*q40Elements : (block+1)*q40Elements]
-		for offset := 0; offset < q40Elements; offset += lanes {
-			end := offset + lanes
-			if end > q40Elements {
-				end = q40Elements
-			}
-
-			var quant simd.Int32s
-			var v simd.Float32s
-			if end-offset == lanes {
-				quant = simd.LoadInt32s(weights[offset:end])
-				v = simd.LoadFloat32s(input[offset:end])
-			} else {
-				quant, _ = simd.LoadInt32sPart(weights[offset:end])
-				v, _ = simd.LoadFloat32sPart(input[offset:end])
-			}
-			w := quant.ConvertToFloat32().Mul(vectorScale)
-			accumulator = w.MulAdd(v, accumulator)
-		}
-	}
-
-	accumulator.Store(partials)
-
-	var result float32
-	for _, value := range partials {
-		result += value
-	}
-	return result
+	return quantDotQ40(row, x)
 }
 
 func dotQ40Batch(row []byte, x, y []float32, input, output, rowIndex, batch int) {
-	var vector simd.Float32s
-	lanes := vector.Len()
-	// SIMD width determines the tile, not a memory-safe total input batch size.
-	const maxTile = 8
-	tileSize := min(lanes, maxTile)
-	partials := make([]float32, lanes)
-	for first := 0; first < batch; first += tileSize {
-		count := min(tileSize, batch-first)
-		var accumulators [maxTile]simd.Float32s
-		for block := 0; block < len(row)/q40BlockBytes; block++ {
-			encoded := row[block*q40BlockBytes : (block+1)*q40BlockBytes]
-			scale := float16(binary.LittleEndian.Uint16(encoded[:2]))
-			var weights [q40Elements]int32
-			for i, packed := range encoded[2:] {
-				weights[i] = int32(packed&15) - 8
-				weights[i+16] = int32(packed>>4) - 8
-			}
-			vectorScale := simd.BroadcastFloat32s(scale)
-			for offset := 0; offset < q40Elements; offset += lanes {
-				end := min(offset+lanes, q40Elements)
-				var quant simd.Int32s
-				if end-offset == lanes {
-					quant = simd.LoadInt32s(weights[offset:end])
-				} else {
-					quant, _ = simd.LoadInt32sPart(weights[offset:end])
-				}
-				w := quant.ConvertToFloat32().Mul(vectorScale)
-				for item := 0; item < count; item++ {
-					start := (first+item)*input + block*q40Elements + offset
-					var v simd.Float32s
-					if end-offset == lanes {
-						v = simd.LoadFloat32s(x[start : start+lanes])
-					} else {
-						v, _ = simd.LoadFloat32sPart(x[start : start+end-offset])
-					}
-					accumulators[item] = w.MulAdd(v, accumulators[item])
-				}
-			}
-		}
-		for item := 0; item < count; item++ {
-			accumulators[item].Store(partials)
-			var sum float32
-			for _, partial := range partials {
-				sum += partial
-			}
-			y[(first+item)*output+rowIndex] = sum
-		}
-	}
+	quantDotQ40Batch(row, x, y, input, output, rowIndex, batch)
 }
 
 func float16(bits uint16) float32 {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -26,6 +27,44 @@ import (
 )
 
 const defaultPaths = "model/gpt-oss-120b-Q4_0-00001-of-00002.gguf\nmodel/gpt-oss-120b-Q4_0-00002-of-00002.gguf"
+
+// Relative Pfade werden im Arbeitsverzeichnis, neben der ausführbaren Datei
+// und eine Ebene darüber gesucht. Letzteres unterstützt bin/stream-pt-ui.
+func resolveModelPath(path string) string {
+	path = filepath.Clean(path)
+	if filepath.IsAbs(path) {
+		return path
+	}
+
+	candidates := []string{path}
+	if executable, err := os.Executable(); err == nil {
+		dir := filepath.Dir(executable)
+		candidates = append(candidates,
+			filepath.Join(dir, path),
+			filepath.Join(dir, "..", path),
+		)
+	}
+
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		absolute, err := filepath.Abs(candidate)
+		if err == nil {
+			return absolute
+		}
+	}
+	return path
+}
+
+func resolvedDefaultPaths() string {
+	lines := strings.Split(defaultPaths, "\n")
+	for i, path := range lines {
+		lines[i] = resolveModelPath(path)
+	}
+	return strings.Join(lines, "\n")
+}
 
 type studio struct {
 	app                                              fyne.App
@@ -53,7 +92,7 @@ func NewWindow(app fyne.App, run inference.Runner) fyne.Window {
 	s.paths = widget.NewMultiLineEntry()
 	s.paths.SetPlaceHolder("One GGUF shard path per line")
 	s.paths.SetMinRowsVisible(3)
-	s.paths.SetText(prefs.StringWithFallback("model-paths", defaultPaths))
+	s.paths.SetText(prefs.StringWithFallback("model-paths", resolvedDefaultPaths()))
 	s.workers = settingEntry("Compute workers", prefs.StringWithFallback("workers", strconv.Itoa(runtime.GOMAXPROCS(0))))
 	s.windowMiB = settingEntry("Window size in MiB", prefs.StringWithFallback("window-mib", "8"))
 	s.maxTokens = settingEntry("Maximum new tokens", prefs.StringWithFallback("max-tokens", "128"))
@@ -123,7 +162,12 @@ func NewWindow(app fyne.App, run inference.Runner) fyne.Window {
 	modelHelp := wrapped("Add every shard belonging to the same model. Paths can be absolute or relative to the working directory.")
 	engineHelp := wrapped("Greedy decoding · 2,048 cache positions\nThe mmap window is not a total RAM limit.\nEach request starts a fresh, independent context.")
 	settings := container.NewVBox(
-		widget.NewCard("Model", "File-backed weights", container.NewVBox(s.paths, s.browse, modelHelp)),
+		widget.NewCard("Model", "File-backed weights", container.NewVBox(
+			s.paths,
+			s.browse,
+			widget.NewButton("Enter GGUF path", s.enterShardPath),
+			modelHelp,
+		)),
 		widget.NewCard("Inference", "CPU & streaming", container.NewVBox(
 			widget.NewForm(widget.NewFormItem("Workers", s.workers), widget.NewFormItem("Window (MiB)", s.windowMiB), widget.NewFormItem("New tokens", s.maxTokens)),
 			engineHelp, s.reset)),
@@ -181,6 +225,15 @@ func (s *studio) start() {
 		s.issue.SetText(err.Error())
 		s.issue.Show()
 		return
+	}
+	for i, path := range r.Paths {
+		r.Paths[i] = resolveModelPath(path)
+		info, err := os.Stat(r.Paths[i])
+		if err != nil || info.IsDir() {
+			s.issue.SetText(fmt.Sprintf("Modelldatei nicht gefunden: %s", r.Paths[i]))
+			s.issue.Show()
+			return
+		}
 	}
 	p := s.app.Preferences()
 	p.SetString("model-paths", strings.Join(r.Paths, "\n"))
@@ -370,7 +423,7 @@ func (s *studio) clearResponse() {
 }
 
 func (s *studio) resetSettings() {
-	s.paths.SetText(defaultPaths)
+	s.paths.SetText(resolvedDefaultPaths())
 	s.workers.SetText(strconv.Itoa(runtime.GOMAXPROCS(0)))
 	s.windowMiB.SetText("8")
 	s.maxTokens.SetText("128")
@@ -378,6 +431,42 @@ func (s *studio) resetSettings() {
 	for _, key := range []string{"model-paths", "workers", "window-mib", "max-tokens"} {
 		p.RemoveValue(key)
 	}
+}
+
+func (s *studio) appendShard(path string) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() || !strings.EqualFold(filepath.Ext(path), ".gguf") {
+		dialog.ShowError(fmt.Errorf("keine lesbare GGUF-Datei: %s", path), s.window)
+		return
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		dialog.ShowError(err, s.window)
+		return
+	}
+	for _, existing := range strings.Split(s.paths.Text, "\n") {
+		if strings.TrimSpace(existing) != "" && resolveModelPath(existing) == absolute {
+			return
+		}
+	}
+	if strings.TrimSpace(s.paths.Text) == "" {
+		s.paths.SetText(absolute)
+	} else {
+		s.paths.SetText(strings.TrimSpace(s.paths.Text) + "\n" + absolute)
+	}
+}
+
+func (s *studio) enterShardPath() {
+	entry := widget.NewEntry()
+	entry.SetPlaceHolder("/absoluter/pfad/zum/modell.gguf")
+	dialog.ShowForm("GGUF-Datei hinzufügen", "Hinzufügen", "Abbrechen",
+		[]*widget.FormItem{widget.NewFormItem("Dateipfad", entry)},
+		func(confirmed bool) {
+			if confirmed {
+				s.appendShard(entry.Text)
+			}
+		}, s.window)
 }
 
 func (s *studio) addShard() {
@@ -394,18 +483,19 @@ func (s *studio) addShard() {
 			dialog.ShowError(err, s.window)
 			return
 		}
-		for _, existing := range strings.Split(s.paths.Text, "\n") {
-			if filepath.Clean(strings.TrimSpace(existing)) == filepath.Clean(path) {
-				return
-			}
-		}
-		if strings.TrimSpace(s.paths.Text) == "" {
-			s.paths.SetText(path)
-		} else {
-			s.paths.SetText(strings.TrimSpace(s.paths.Text) + "\n" + path)
-		}
+		s.appendShard(path)
 	}, s.window)
 	d.SetFilter(storage.NewExtensionFileFilter([]string{".gguf"}))
+
+	first := strings.TrimSpace(strings.Split(s.paths.Text, "\n")[0])
+	if first != "" {
+		dir := filepath.Dir(resolveModelPath(first))
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			if location, err := storage.ListerForURI(storage.NewFileURI(dir)); err == nil {
+				d.SetLocation(location)
+			}
+		}
+	}
 	d.Resize(fyne.NewSize(800, 520))
 	d.Show()
 }

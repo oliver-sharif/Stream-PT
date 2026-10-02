@@ -256,13 +256,61 @@ Quantized benchmarks use one compute worker and warm synthetic weights.
 | Q4_0 batch 4, 512 inputs | 0.673 ms | 0.469 ms |
 | Q4_0 batch 8, 512 inputs | 1.403 ms | 0.906 ms |
 
-Q4_0/Q8_0 convert and scale decoded integers in SIMD vectors; MXFP4 uses a shared
-16 KiB scaled-value table. Full SIMD loads avoid partial-load overhead while tails
-remain supported. The engine reuses MoE and attention scratch across layers/tokens,
+Q4_0/Q8_0 use register-based byte widening on AVX2/FMA-capable amd64 CPUs,
+with portable narrow-SIMD and scalar fallbacks selected by hardware capability.
+MXFP4 uses a shared 16 KiB scaled-value table. Full SIMD loads avoid partial-load
+overhead while tails remain supported. The engine reuses MoE and attention scratch across layers/tokens,
 and the KV cache uses contiguous backing storage per layer rather than per-position
 allocations. During prompt prefill, only the last token runs the output norm and
-LM-head projection; all tokens still update the transformer layers and KV cache.
+LM-head projection. Prefill processes up to 32 prompt positions layer by layer,
+sharing projection weights across the batch; attention populates and reads the
+KV cache in causal position order, including GQA, sinks, and sliding windows.
+MoE routing groups positions by expert so each selected expert's projections
+share their weight reads. Decode remains sequential.
 These changes do not cache full weight tensors or establish full-model tokens/second.
+
+`EngineOptions.PrefillBatchSize` controls activation memory versus weight reuse;
+zero defaults to 32, and one selects sequential prefill. Larger values are capped
+to the prompt length and KV capacity, not to SIMD width. Batch activation scratch
+is reused across layers/chunks; it is additional memory beyond the mapping window
+and KV cache. `Engine.Prefill` also accepts a starting position for appending a
+prompt segment to an existing prefix. Engines and scratch are not concurrency-safe.
+Standalone attention callers can pass `AttentionOptions.Scratch` to reuse both
+scores and SIMD reduction storage; the engine does this automatically.
+Q4_0/Q8_0 compute workers remain alive across all windows of a multiplication,
+with a completion barrier before each window is unmapped. The one-worker path
+does not launch a goroutine; workers do not survive the multiplication.
+
+Tokenizer encoding retains greedy longest-prefix semantics (not merge-ranked
+BPE), but uses a vocabulary trie rather than repeatedly creating candidate strings.
+Vocabulary loading uses buffered reads and allocation-free rune counts. GGUF
+fixed-width metadata arrays are skipped in one operation after validating their
+element type, byte count, and file bounds; variable-width arrays still need parsing.
+
+Additional synthetic benchmarks compare prefill batch sizes, worker/window
+combinations, and startup costs:
+
+```sh
+GOEXPERIMENT=simd go test ./tests -run '^$' -bench '^(BenchmarkPrefillBatch|BenchmarkTokenizerOptimization|BenchmarkIndexOptimization|BenchmarkQuantOptimization)' -benchmem -benchtime=1s -count=3
+```
+
+On the i7-4790T, the synthetic 32-position prefill benchmark (three layers,
+64 hidden elements, three experts/top-two, GQA, warm weights, one worker,
+8 MiB window) measured these medians over three 1-second runs:
+
+| Prefill batch | Time | Allocations per prompt |
+| --- | ---: | ---: |
+| 1 (sequential, final output projection only) | 69.54 ms | ~9,001 |
+| 8 | 48.62 ms | 1,259 |
+| 32 | 45.90 ms | 476 |
+
+This is about 34% less time for this small synthetic prompt, not a measurement
+of full-model tokens/second or cold-storage inference. Reused standalone
+attention scratch performs no heap allocations after its initial sizing.
+
+Keep the mapping window conservative on low-memory systems. Compare 8, 32, and
+64 MiB with one, two, and four workers on the actual storage device; warm synthetic
+weights cannot select an optimal HDD/SSD window or thread count for you.
 
 ## Project layout
 

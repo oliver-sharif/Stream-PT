@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"regexp"
 	"sort"
@@ -305,7 +306,7 @@ func readFile(path string) (
 			return nil, nil, nil, 0, err
 		}
 
-		number, numeric, err := skipValue(f, typ, 0)
+		number, numeric, err := skipValue(f, typ, 0, stat.Size())
 		if err != nil {
 			return nil, nil, nil, 0, fmt.Errorf(
 				"metadata %q: %w", key, err,
@@ -435,7 +436,22 @@ func readString(r io.Reader) (string, error) {
 	return string(data), nil
 }
 
-func skipValue(f *os.File, typ uint32, depth int) (uint64, bool, error) {
+func metadataWidth(typ uint32) int {
+	switch typ {
+	case 0, 1, 7:
+		return 1
+	case 2, 3:
+		return 2
+	case 4, 5, 6:
+		return 4
+	case 10, 11, 12:
+		return 8
+	default:
+		return 0
+	}
+}
+
+func skipValue(f *os.File, typ uint32, depth int, fileSize int64) (uint64, bool, error) {
 	if depth > 8 {
 		return 0, false, fmt.Errorf("metadata nesting is too deep")
 	}
@@ -454,9 +470,34 @@ func skipValue(f *os.File, typ uint32, depth int) (uint64, bool, error) {
 		if count > 100_000_000 {
 			return 0, false, fmt.Errorf("array is too large")
 		}
+		width := metadataWidth(elementType)
+		if width == 0 && elementType != 8 && elementType != 9 {
+			return 0, false, fmt.Errorf("unknown metadata type %d", elementType)
+		}
+		if width != 0 {
+			if count == 0 {
+				return 0, false, nil
+			}
+			if depth == 8 {
+				return 0, false, fmt.Errorf("metadata nesting is too deep")
+			}
+			if count > uint64(math.MaxInt64)/uint64(width) {
+				return 0, false, fmt.Errorf("array byte size overflows")
+			}
+			length := int64(count * uint64(width))
+			position, err := f.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return 0, false, err
+			}
+			if position < 0 || position > fileSize || length > fileSize-position {
+				return 0, false, io.ErrUnexpectedEOF
+			}
+			_, err = f.Seek(length, io.SeekCurrent)
+			return 0, false, err
+		}
 		for i := uint64(0); i < count; i++ {
 			if _, _, err := skipValue(
-				f, elementType, depth+1,
+				f, elementType, depth+1, fileSize,
 			); err != nil {
 				return 0, false, err
 			}
@@ -469,13 +510,7 @@ func skipValue(f *os.File, typ uint32, depth int) (uint64, bool, error) {
 		return 0, false, err
 	}
 
-	width := map[uint32]int{
-		0: 1, 1: 1,
-		2: 2, 3: 2,
-		4: 4, 5: 4, 6: 4,
-		7:  1,
-		10: 8, 11: 8, 12: 8,
-	}[typ]
+	width := metadataWidth(typ)
 	if width == 0 {
 		return 0, false, fmt.Errorf("unknown metadata type %d", typ)
 	}

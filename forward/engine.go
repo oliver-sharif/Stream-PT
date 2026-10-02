@@ -3,12 +3,14 @@
 package forward
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
+	"unicode/utf8"
 
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
@@ -16,24 +18,26 @@ import (
 
 // EngineOptions configures runtime concurrency and streaming memory limits.
 type EngineOptions struct {
-	Workers     int    // Number of worker goroutines for matrix multiplications (default: runtime.GOMAXPROCS(0))
-	WindowBytes uint64 // Chunk window size in bytes for streaming mmap (default: 8 MiB)
+	Workers          int    // Number of worker goroutines for matrix multiplications (default: runtime.GOMAXPROCS(0))
+	WindowBytes      uint64 // Chunk window size in bytes for streaming mmap (default: 8 MiB)
+	PrefillBatchSize int    // Prompt positions per weight pass (default: 32; one uses the decode path).
 }
 
 // Engine manages the end-to-end streaming inference pipeline.
 type Engine struct {
-	Model        *ggufindex.Model
-	Reader       *ggufmmap.Reader
-	Config       *Config
-	Options      EngineOptions
-	Layers       []LayerWeights
-	TokenEmbd    ggufindex.Tensor
-	OutputNorm   ggufindex.Tensor
-	OutputWeight ggufindex.Tensor
-	KVCache      *KVCache
-	X            []float32
-	Scratch      *LayerScratch
-	Tokenizer    *Tokenizer
+	Model          *ggufindex.Model
+	Reader         *ggufmmap.Reader
+	Config         *Config
+	Options        EngineOptions
+	Layers         []LayerWeights
+	TokenEmbd      ggufindex.Tensor
+	OutputNorm     ggufindex.Tensor
+	OutputWeight   ggufindex.Tensor
+	KVCache        *KVCache
+	X              []float32
+	Scratch        *LayerScratch
+	Tokenizer      *Tokenizer
+	prefillScratch *prefillScratch
 }
 
 // NewEngine initializes the inference engine with default options.
@@ -55,6 +59,9 @@ func NewEngineWithOptions(model *ggufindex.Model, reader *ggufmmap.Reader, optio
 	}
 	if options.WindowBytes == 0 {
 		options.WindowBytes = DefaultQ40WindowBytes
+	}
+	if options.PrefillBatchSize < 0 {
+		return nil, fmt.Errorf("invalid prefill batch size %d", options.PrefillBatchSize)
 	}
 
 	cfg, err := NewConfigFromModel(model)
@@ -171,7 +178,10 @@ func (e *Engine) forwardToken(ctx context.Context, tokenID, pos int, projectOutp
 	if !projectOutput {
 		return 0, nil
 	}
+	return e.projectOutput(ctx, opts)
+}
 
+func (e *Engine) projectOutput(ctx context.Context, opts Q40Options) (int, error) {
 	// 3. Final layer norm.
 	if err := RMSNormInto(ctx, e.Reader, e.OutputNorm, e.X, e.Scratch.NormedX, e.Config.RMSNormEps); err != nil {
 		return 0, fmt.Errorf("final norm: %w", err)
@@ -221,12 +231,9 @@ func (e *Engine) Generate(
 	var nextToken int
 	var err error
 
-	// Prefill only needs the next-token projection for the last prompt token.
-	for pos, tok := range promptTokens {
-		nextToken, err = e.forwardToken(ctx, tok, pos, pos == len(promptTokens)-1)
-		if err != nil {
-			return nil, fmt.Errorf("prefill step %d (token %d): %w", pos, tok, err)
-		}
+	nextToken, err = e.Prefill(ctx, promptTokens, 0)
+	if err != nil {
+		return nil, err
 	}
 
 	pos := len(promptTokens)
@@ -264,6 +271,7 @@ type Tokenizer struct {
 	byteToUnicode [256]rune
 	unicodeToByte map[rune]byte
 	maxTokenLen   int
+	encoder       tokenizerEncoder
 }
 
 func initByteToUnicode() ([256]rune, map[rune]byte) {
@@ -314,13 +322,14 @@ func LoadTokenizer(model *ggufindex.Model) (*Tokenizer, error) {
 	if _, err := f.Seek(int64(meta.Range.Start), io.SeekStart); err != nil {
 		return nil, err
 	}
+	r := bufio.NewReader(f)
 
 	var elemType uint32
 	var count uint64
-	if err := binary.Read(f, binary.LittleEndian, &elemType); err != nil {
+	if err := binary.Read(r, binary.LittleEndian, &elemType); err != nil {
 		return nil, err
 	}
-	if err := binary.Read(f, binary.LittleEndian, &count); err != nil {
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
 		return nil, err
 	}
 	if elemType != 8 || count > 1000000 {
@@ -334,29 +343,31 @@ func LoadTokenizer(model *ggufindex.Model) (*Tokenizer, error) {
 
 	for i := 0; i < int(count); i++ {
 		var strLen uint64
-		if err := binary.Read(f, binary.LittleEndian, &strLen); err != nil {
+		if err := binary.Read(r, binary.LittleEndian, &strLen); err != nil {
 			return nil, err
 		}
 		buf := make([]byte, int(strLen))
-		if _, err := io.ReadFull(f, buf); err != nil {
+		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, err
 		}
 		str := string(buf)
 		tokens[i] = str
 		tokenMap[str] = i
-		rCount := len([]rune(str))
+		rCount := utf8.RuneCountInString(str)
 		if rCount > maxTokenLen {
 			maxTokenLen = rCount
 		}
 	}
 
-	return &Tokenizer{
+	tokenizer := &Tokenizer{
 		Tokens:        tokens,
 		TokenMap:      tokenMap,
 		byteToUnicode: b2u,
 		unicodeToByte: u2b,
 		maxTokenLen:   maxTokenLen,
-	}, nil
+	}
+	tokenizer.initEncoder()
+	return tokenizer, nil
 }
 
 // Decode converts token IDs into human-readable text.
@@ -385,30 +396,27 @@ func (t *Tokenizer) Encode(text string) []int {
 	if t == nil || len(text) == 0 {
 		return nil
 	}
-	rawBytes := []byte(text)
-	bpeRunes := make([]rune, len(rawBytes))
-	for i, b := range rawBytes {
-		bpeRunes[i] = t.byteToUnicode[b]
-	}
+	t.initEncoder()
 
 	var tokenIDs []int
-	for i := 0; i < len(bpeRunes); {
-		maxJ := min(len(bpeRunes), i+t.maxTokenLen)
-		matched := false
-		for j := maxJ; j > i; j-- {
-			sub := string(bpeRunes[i:j])
-			if id, ok := t.TokenMap[sub]; ok {
-				tokenIDs = append(tokenIDs, id)
-				i = j
-				matched = true
+	for i := 0; i < len(text); {
+		node := t.encoder.root[text[i]]
+		matchedEnd, matchedID := i, 0
+		for j := i; j < len(text); j++ {
+			if node == 0 {
 				break
 			}
-		}
-		if !matched {
-			sub := string(bpeRunes[i])
-			if id, ok := t.TokenMap[sub]; ok {
-				tokenIDs = append(tokenIDs, id)
+			if n := t.encoder.nodes[node]; n.terminal {
+				matchedEnd, matchedID = j+1, n.id
 			}
+			if j+1 < len(text) {
+				node = t.encoder.next(node, text[j+1])
+			}
+		}
+		if matchedEnd > i {
+			tokenIDs = append(tokenIDs, matchedID)
+			i = matchedEnd
+		} else {
 			i++
 		}
 	}

@@ -147,12 +147,11 @@ func ForwardLayer(
 	if layerIdx%2 == 0 {
 		window = cfg.SlidingWindow
 	}
-	if len(scratch.scores) < cache.MaxPos {
-		scratch.scores = make([]float32, cache.MaxPos)
-	}
+	var attentionVector simd.Float32s
+	scratch.attention.prepare(cache.MaxPos, attentionVector.Len())
 	forwardAttention(scratch.Q, scratch.K, scratch.V, cache, layerIdx, pos,
 		cfg.NumHeads, cfg.NumKVHeads, cfg.HeadDim, scratch.AttnCtx,
-		AttentionOptions{Sinks: scratch.Sinks, SlidingWindow: window}, scratch.scores)
+		AttentionOptions{Sinks: scratch.Sinks, SlidingWindow: window}, scratch.attention.scores, scratch.attention.partials)
 
 	// 5. Attention Output Projection
 	if err := MulQ40Into(ctx, reader, lw.AttnOutput, scratch.AttnCtx, scratch.AttnProj, options); err != nil {
@@ -199,16 +198,16 @@ func ForwardLayer(
 
 // LayerScratch holds reusable temporary buffers to avoid allocations per layer.
 type LayerScratch struct {
-	NormedX  []float32
-	Q        []float32
-	K        []float32
-	V        []float32
-	Sinks    []float32
-	AttnCtx  []float32
-	AttnProj []float32
-	FFNOut   []float32
-	moe      *moeScratch
-	scores   []float32
+	NormedX   []float32
+	Q         []float32
+	K         []float32
+	V         []float32
+	Sinks     []float32
+	AttnCtx   []float32
+	AttnProj  []float32
+	FFNOut    []float32
+	moe       *moeScratch
+	attention AttentionScratch
 }
 
 // NewLayerScratch allocates scratch buffers for a forward step.
