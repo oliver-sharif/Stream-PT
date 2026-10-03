@@ -36,6 +36,7 @@ func main() {
 	expertCacheMBFlag := flag.Uint64("expert-cache-mb", 0, "Maximum locked hot-expert cache in MiB (0 disables retention)")
 	expertMinUsesFlag := flag.Uint64("expert-cache-min-uses", 8, "Expert matrix uses before hot-cache admission")
 	expertStatsFlag := flag.Bool("expert-stats", false, "Track and report selected expert matrix frequencies")
+	noExpertLookaheadFlag := flag.Bool("no-expert-lookahead", false, "Disable prefetch of the next selected expert run (for comparison)")
 
 	flag.Parse()
 	if *expertCacheMBFlag > ^uint64(0)>>20 {
@@ -61,6 +62,9 @@ func main() {
 			log.Print(err)
 		}
 	}()
+	if err := reader.ConfigureExpertLookahead(!*noExpertLookaheadFlag); err != nil {
+		log.Fatalf("Failed to configure expert lookahead: %v", err)
+	}
 	if err := reader.ConfigureExpertCache(ggufmmap.ExpertCacheOptions{
 		MaxBytes:   *expertCacheMBFlag << 20,
 		MinUses:    *expertMinUsesFlag,
