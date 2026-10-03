@@ -64,11 +64,14 @@ A CLI-only build does not require Fyne's native OpenGL/X11 development dependenc
 | --- | --- | --- | --- |
 | `-prompt` | `-p` | Built-in example prompt | User text to wrap as a chat prompt; positional text is also accepted. |
 | `-max-tokens` | `-n` | `5` | Maximum number of new tokens. |
-| `-threads` | `-t` | `GOMAXPROCS` | Requested compute worker count; kernels may cap it. |
-| `-window-mb` | `-w` | `8` | Q4_0/Q8_0 streaming window in MiB; use a positive value. |
+| `-threads` | `-t` | `GOMAXPROCS` | Compute worker count; the CLI sets Go's compute slots to this value. Kernels may cap it by available rows. |
+| `-window-mb` | `-w` | `64` | Q4_0/Q8_0 streaming window in MiB; use a positive value. |
+| `-expert-cache-mb` | — | `0` | Page-rounded budget for locked hot expert mappings; zero disables retention. |
+| `-expert-cache-min-uses` | — | `8` | Selected matrix passes before cache admission; zero admits on first use. |
+| `-expert-stats` | — | `false` | Track matrix-range frequencies and report selected bytes, mapping runs, cache hits and the eight hottest ranges. |
 
-The window is not a total RAM limit: MXFP4 computation currently maps one selected
-expert matrix at a time, and activations, tokenizer data, KV cache, and the OS page
+The window is not a total RAM limit: MXFP4 computation maps selected expert runs
+(see below), and activations, tokenizer data, KV cache, and the OS page
 cache consume additional memory. Full 120B inference can be expensive even when
 weights are file-backed. Some existing command-line status messages remain German.
 
@@ -179,8 +182,8 @@ GOEXPERIMENT=simd go test -tags ci ./...
 
 The `ci` tag selects Fyne's software driver for the desktop command package;
 do not use it to build a production GUI binary. The existing `./tests` commands
-need no display because UI tests use Fyne's test driver. All tests continue to
-live in `tests/`; an untagged `./...` run also builds the native desktop entry
+need no display because UI tests use Fyne's test driver. Kernel/UI tests live
+in `tests/`, with CLI flag regression tests beside `main.go`; an untagged `./...` run also builds the native desktop entry
 point and needs its OpenGL/X11 build dependencies.
 
 They also run directly from the test directory:
@@ -258,7 +261,9 @@ Quantized benchmarks use one compute worker and warm synthetic weights.
 
 Q4_0/Q8_0 use register-based byte widening on AVX2/FMA-capable amd64 CPUs,
 with portable narrow-SIMD and scalar fallbacks selected by hardware capability.
-MXFP4 uses a shared 16 KiB scaled-value table. Full SIMD loads avoid partial-load
+MXFP4 uses register-based nibble decoding and 256-bit FMA on AVX2/FMA-capable
+amd64 CPUs, including Haswell, for both decode and prefill. Its portable fallback
+uses a shared 16 KiB scaled-value table. Full SIMD loads avoid partial-load
 overhead while tails remain supported. The engine reuses MoE and attention scratch across layers/tokens,
 and the KV cache uses contiguous backing storage per layer rather than per-position
 allocations. During prompt prefill, only the last token runs the output norm and
@@ -266,7 +271,8 @@ LM-head projection. Prefill processes up to 32 prompt positions layer by layer,
 sharing projection weights across the batch; attention populates and reads the
 KV cache in causal position order, including GQA, sinks, and sliding windows.
 MoE routing groups positions by expert so each selected expert's projections
-share their weight reads. Decode remains sequential.
+share their weight reads. Decode remains sequential. Expert mappings are scheduled
+by physical position, with optional bounded hot-range retention (see below).
 These changes do not cache full weight tensors or establish full-model tokens/second.
 
 `EngineOptions.PrefillBatchSize` controls activation memory versus weight reuse;
@@ -309,7 +315,7 @@ of full-model tokens/second or cold-storage inference. Reused standalone
 attention scratch performs no heap allocations after its initial sizing.
 
 Keep the mapping window conservative on low-memory systems. Compare 8, 32, and
-64 MiB with one, two, and four workers on the actual storage device; warm synthetic
+64 MiB with one, two, four, and eight workers on the actual storage device; warm synthetic
 weights cannot select an optimal HDD/SSD window or thread count for you.
 
 ## Project layout
@@ -367,11 +373,163 @@ be computed as an independent batch. Choose batch size from the available activa
 and KV-cache budget, then benchmark it. `simd.Emulated()` and `simd.VectorBitSize()`
 can distinguish emulation and vector width when reporting measurements.
 
+## Selected-expert streaming and hot cache
+
+Both decode and prefill finish the full F32 router and top-k selection before
+mapping any MXFP4 expert weights. Zero-weight experts are skipped; prefill reads
+the union of selected experts used by the batch. Existing nonfinite-router
+fallback semantics are retained.
+Gate/up projections are independent and sorted together by GGUF file and physical
+offset. After SwiGLU, down projections are sorted in a second pass. Output
+accumulation stays in router rank order, independently of the physical layout.
+Expert biases are also read only for selected experts.
+
+`Reader.WithExpertRanges` merges **exactly adjacent selected** ranges, never gaps
+containing unselected experts. Merged runs are capped at 32 MiB; a single larger
+expert matrix is mapped on its own. Only one run is active at a time, plus an
+optional bias mapping and retained hot runs. Mappings are read-only, zero-copy,
+and released after all row workers finish. Linux `MADV_RANDOM` suppresses speculative
+readahead; page-aligned `MADV_WILLNEED` requests cover the current selected run in
+128 KiB pieces, without requesting the next unselected expert. One large
+`WILLNEED` request can be truncated to Linux's device readahead/I/O window;
+with `RANDOM` this previously left the rest of a large expert to demand faults.
+Both are best-effort hints, not a residency guarantee; smaller device windows or
+memory pressure can still limit prefetch. Page alignment can share boundary pages
+with an unselected expert: byte-exact physical disk I/O cannot be guaranteed.
+Q4_0/Q8_0 retain their separate sequential streaming-window policy.
+
+SIMD/FMA and goroutines remain in the matrix kernels. The one-input path computes
+directly from quantized blocks; multiple inputs share decoded rows across tiles
+of up to 16 routed positions. Scheduling across projections requires reusable
+activation storage of approximately `4 * batch * topK * (3 * expertHidden + hidden)`
+bytes for gate/up/SwiGLU and rank outputs, plus router, bias and per-worker row
+scratch. This trades activation RAM for fewer file seeks and mappings, not for
+floating-point copies of expert tensors. Reduce `EngineOptions.PrefillBatchSize`
+if this activation budget is too large.
+
+By default, expert pages remain eligible for the shared OS page cache; this reader
+does not evict them or drop global caches. For explicit bounded residency:
+
+```sh
+GOEXPERIMENT=simd go run . -threads 4 -window-mb 8 -expert-stats \
+  -expert-cache-mb 64 -expert-cache-min-uses 8 -prompt "Hello" -max-tokens 16
+```
+
+The optional cache counts uses per exact expert **matrix range**, not per token
+or semantic expert across layers. A prefill batch contributes one use per matrix
+pass. Runs are admitted after all member ranges reach the threshold, first-come
+within the page-rounded budget, without eviction or replacement. Only exact run
+matches are reused; changing selections can produce different runs. Admission
+uses `mlock`, so Linux `RLIMIT_MEMLOCK`/permissions may prevent retention; failures
+are counted and inference continues with ordinary streaming. The budget is an
+upper limit, not a promise that that much RAM will be locked. `Reader.Close`
+unlocks/unmaps retained runs. Configure before first use; do not close during
+computation. The desktop uses the sparse schedule automatically; these optional
+cache controls currently appear only in the CLI and reader API.
+
+For API callers, `ConfigureExpertCache(ggufmmap.ExpertCacheOptions{MaxBytes: ...,
+MinUses: ..., TrackStats: true})` enables retention/statistics, and
+`ExpertCacheStats()` returns an independent snapshot including `RangeUses`,
+`SelectedBytes`, `MappedRuns`, `CachedBytes`, `CacheHits`, `LockFailures`,
+`PrefetchCalls` and `PrefetchFailures`.
+Without cache/statistics there is no per-range frequency history.
+
+Synthetic tests check numerical results against an independent scalar reference,
+worker counts, cancellation, physical ordering, adjacent/gapped/sharded ranges,
+cleanup, cache bounds and the exact selected-byte accounting. In a two-of-eight
+fixture, six matrix ranges become three runs and only 25% of expert weight bytes
+are requested; repeated positions in a batch do not multiply those requested bytes.
+
+```sh
+GOEXPERIMENT=simd go test ./tests -run '^(TestSparseMoE|TestWithExpertRanges|TestForwardMoEBatch)' -count=1
+GOEXPERIMENT=simd go test ./tests -run '^$' -bench '^(BenchmarkSparseMoE|BenchmarkForwardMoEBatch)$' -benchmem -benchtime=1s -count=3
+```
+
+On the i7-4790T, compare one, two and four workers before enabling more threads;
+eight logical threads need not outperform four physical cores. These benchmarks
+use small warm synthetic weights, not cold 120B storage or full-model token rates.
+The main expected storage benefit is fewer seeks/mappings and no unselected weight
+reads, rather than a guaranteed large warm-cache compute speedup.
+
+Measured on the i7-4790T with Go 1.27.1/SIMD: medians of three 300 ms runs of
+`BenchmarkSparseMoE`, 256 hidden / 512 expert hidden, 32 experts/top-two, tied
+router scores, no biases, warm weights, cache disabled. Times include standalone
+scratch allocation (the engine reuses it):
+
+| Positions | 1 worker | 2 workers | 4 workers |
+| --- | ---: | ---: | ---: |
+| 1 | 0.988 ms | 0.877 ms | 0.841 ms |
+| 32 | 25.78 ms | 11.73 ms | 10.97 ms |
+
+The one-worker 32-position samples ranged from 17.39 to 28.06 ms; rerun on your
+own storage/workload rather than treating these short warm-cache samples as a
+throughput guarantee. Cache admission and cold-disk latency are not measured here.
+
+### Full-model performance audit (64 MiB / eight workers)
+
+The earlier expert implementation already sliced and read **selected experts**.
+Mapping a large tensor address range also does not itself read all its bytes.
+Physical sorting/coalescing therefore did not eliminate a previously dense
+128-expert compute pass; expecting a 32x speedup from top-four routing was incorrect.
+The previous CLI additionally called `GOMAXPROCS(4)` while defining both thread
+flags, limiting many kernels to four compute slots even with `-threads 8`.
+Both flags now read the default without changing it, and explicit thread selection
+sets `GOMAXPROCS`; startup prints the actual compute slots.
+
+An actual 120B profile located about 95% of CPU samples in MXFP4 expert operations,
+including generic 128-bit SIMD dot products and scalar prefill row decoding.
+The AVX2 path now decodes E2M1 nibbles with vector permutations/sign bits, shares
+decoded rows during prefill, and uses four independent FMA accumulators to reduce
+dependency stalls. The SIMD fallback and row-worker goroutines remain available.
+The prefetch fix above addresses the accompanying cold-page fault bottleneck.
+
+Measured on the **i7-4790T, Go 1.27.1, actual two-shard GPT-OSS-120B model**, using
+`Hallo, sag nur Ja!` (15 framed prompt tokens), 64 MiB dense windows, eight workers
+and eight compute slots, default prefill batching, hot-expert retention disabled:
+
+| Phase | Before this audit (two runs) | After (two runs) |
+| --- | ---: | ---: |
+| Prefill / first next-token prediction | 90.17–92.82 s | 21.56–22.25 s |
+| First decode step | 8.58–8.69 s | 3.91–4.04 s |
+| Second decode step | 7.57–7.71 s | 3.38–3.93 s |
+| Sum of these inference phases | 106.32–109.22 s | 28.98–30.08 s |
+| Prefill major page faults | 370,775–387,920 | 6,727–7,065 |
+
+Both versions predicted the same IDs (`30109`, `13`, `200002`) and selected the
+same expert bytes: 10,539.29 MiB for prefill, 1,815.38 MiB per decode step.
+This is approximately 3.5–3.8x faster for these phases, with roughly 2x faster
+decode, **not** a general throughput guarantee. The before binary already used
+eight compute slots in this harness, isolating kernel/I/O improvements from the
+separate CLI thread fix. Runs alternated before/after without dropping global
+caches or pinning CPU frequency; disk input remained substantial. Startup and
+tokenizer loading are excluded. This short prompt is not a long-generation test.
+
+Reproduce explicitly (normal tests do not run this expensive workload):
+
+```sh
+STREAM_PT_MODEL_PERF=1 STREAM_PT_WORKERS=8 GOEXPERIMENT=simd \
+  go test ./tests -run '^TestModelPerformance$' -v -count=1
+mkdir -p bin
+STREAM_PT_MODEL_PERF=1 STREAM_PT_WORKERS=8 GOEXPERIMENT=simd \
+  go test ./tests -run '^TestModelPerformance$' -v -count=1 \
+  -cpuprofile bin/model-cpu.pprof -o bin/model-perf.test
+go tool pprof -top bin/model-perf.test bin/model-cpu.pprof
+GOEXPERIMENT=simd go run . -threads 8 -window-mb 64 \
+  -prompt "Hallo, sag nur Ja!" -max-tokens 5 -expert-stats
+```
+
+The harness reports each phase's wall/CPU time, selected bytes, mappings, major
+faults, block-input operations and prefetch failures. Use the same prompt and
+storage/cache conditions when comparing; selected bytes are logical accesses,
+not a measurement of physical disk bytes. Automated tests additionally cover
+all packed nibble values, all 256 scales (including subnormal/Inf/NaN behavior),
+eight-worker computation and complete selected-mapping prefetch coverage.
+
 ## Memory and throughput limits
 
 `mmap` avoids a Go-heap copy; it does **not** avoid physical RAM. Touched weight pages
 live in the OS page cache. Windowing bounds this reader's active mapping, not the
-system page cache or total process RAM. Sequential advice permits kernel readahead;
+system page cache or total process RAM. Dense sequential advice permits kernel readahead;
 the reader deliberately does not evict globally shared file-cache pages.
 
 When the working set exceeds RAM, repeated weight passes are storage-bandwidth

@@ -68,6 +68,9 @@ func MulMXFP4Expert(
 		return fmt.Errorf("%q: dimension mismatch (x=%d in=%d, y=%d out=%d)",
 			tensor.Name, len(x), inDim, len(y), outDim)
 	}
+	if err := validateMoEBatchExpert(tensor, inDim, outDim, numExperts); err != nil {
+		return err
+	}
 
 	blocksPerRow := inDim / mxfp4Elements
 	rowBytes := uint64(blocksPerRow * mxfp4BlockBytes)
@@ -80,14 +83,7 @@ func MulMXFP4Expert(
 		End:   tensor.Range.Start + expertOffset + expertBytes,
 	}
 
-	expertTensor := ggufindex.Tensor{
-		Name:  fmt.Sprintf("%s[expert_%d]", tensor.Name, expertIdx),
-		Type:  tensor.Type,
-		Shape: []uint64{uint64(inDim), uint64(outDim)},
-		Range: span,
-	}
-
-	return reader.WithTensor(expertTensor, func(data []byte) error {
+	return reader.WithExpertRanges([]ggufindex.Range{span}, func(_ int, data []byte) error {
 		if uint64(len(data)) < expertBytes {
 			return fmt.Errorf("short read for expert %d: %d < %d", expertIdx, len(data), expertBytes)
 		}
@@ -124,9 +120,16 @@ func MulMXFP4Expert(
 }
 
 func dotMXFP4(row []byte, x []float32) float32 {
+	if value, ok := dotMXFP4Fast(row, x); ok {
+		return value
+	}
 	var accumulator simd.Float32s
 	lanes := accumulator.Len()
-	partials := make([]float32, lanes)
+	var local [64]float32
+	partials := local[:min(lanes, len(local))]
+	if lanes > len(local) {
+		partials = make([]float32, lanes)
+	}
 
 	numBlocks := len(row) / mxfp4BlockBytes
 	for block := 0; block < numBlocks; block++ {

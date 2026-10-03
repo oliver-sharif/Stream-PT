@@ -121,10 +121,12 @@ func (a *studioTestApp) NewWindow(title string) fyne.Window {
 
 func desktopFixture(t *testing.T, runner inference.Runner) fyne.Window {
 	t.Helper()
+	path, _ := indexOptimizationFixture(t)
 	base := test.NewApp()
 	a := &studioTestApp{App: base, driver: &studioTestDriver{Driver: base.Driver()}}
 	fyne.SetCurrentApp(a)
 	w := desktop.NewWindow(a, runner)
+	fyne.DoAndWait(func() { studioEntry(w, "One GGUF shard path per line").SetText(path) })
 	t.Cleanup(func() {
 		fyne.DoAndWait(func() { w.Close() })
 		awaitStudio(t, func() bool { return w.(*studioTestWindow).closed })
@@ -254,6 +256,25 @@ func TestDesktopStreamsAndStops(t *testing.T) {
 			t.Error("prompt persisted unexpectedly")
 		}
 	})
+}
+
+func TestDesktopMissingModelDoesNotStart(t *testing.T) {
+	var called atomic.Bool
+	w := desktopFixture(t, func(context.Context, inference.Request, func(inference.Event)) error {
+		called.Store(true)
+		return nil
+	})
+	fyne.DoAndWait(func() {
+		studioEntry(w, "One GGUF shard path per line").SetText(filepath.Join(t.TempDir(), "missing.gguf"))
+		studioEntry(w, "Ask a question or describe a task…").SetText("Missing model")
+		test.Tap(studioButton(w, "Generate"))
+		if !studioHasLabel(w, "Modelldatei nicht gefunden:") || studioButton(w, "Generate").Disabled() || !studioButton(w, "Stop").Disabled() {
+			t.Error("missing model did not remain in validation state")
+		}
+	})
+	if called.Load() {
+		t.Fatal("missing model reached runner")
+	}
 }
 
 func TestDesktopValidationCompletionAndFailure(t *testing.T) {
