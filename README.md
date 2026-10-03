@@ -164,8 +164,9 @@ so stopping or closing during initialization may take time.
 
 ## Run the tests
 
-All test files and benchmark fixtures live in `tests/`. They test the production
+Most test files and benchmark fixtures live in `tests/`. They test the production
 packages through their public APIs; no copied production kernels are used.
+Targeted private-kernel reference tests and microbenchmarks also live in `forward/`.
 From the repository root:
 
 ```sh
@@ -399,8 +400,10 @@ with an unselected expert: byte-exact physical disk I/O cannot be guaranteed.
 Q4_0/Q8_0 retain their separate sequential streaming-window policy.
 
 SIMD/FMA and goroutines remain in the matrix kernels. The one-input path computes
-directly from quantized blocks; multiple inputs share decoded rows across tiles
-of up to 16 routed positions. Scheduling across projections requires reusable
+directly from quantized blocks. On AVX2/FMA, groups of two to four routed positions
+use fused pairs sharing decoded register weights without a floating-point row
+buffer; larger groups share decoded rows across tiles of up to 16 positions.
+Scheduling across projections requires reusable
 activation storage of approximately `4 * batch * topK * (3 * expertHidden + hidden)`
 bytes for gate/up/SwiGLU and rank outputs, plus router, bias and per-worker row
 scratch. This trades activation RAM for fewer file seeks and mappings, not for
@@ -524,6 +527,72 @@ storage/cache conditions when comparing; selected bytes are logical accesses,
 not a measurement of physical disk bytes. Automated tests additionally cover
 all packed nibble values, all 256 scales (including subnormal/Inf/NaN behavior),
 eight-worker computation and complete selected-mapping prefetch coverage.
+
+### Additional SIMD audit on Haswell
+
+Further CPU profiling led to these incremental changes, without changing selected
+expert ranges, streaming windows, goroutine scheduling or cache policy:
+
+- MXFP4 AVX2 permutations load already scaled positive levels from the existing
+  16 KiB table, avoiding four scaling multiplications per block. `VPERMPS` already
+  masks its index modulo eight, so redundant index masks are removed. Sign bits,
+  subnormal values, overflow and NaN behavior remain covered by reference tests.
+- Small MoE groups use buffer-free fused pairs with eight independent FMA
+  accumulators. The per-position accumulation order matches single-position
+  computation; the existing exact batch/sequential tests remain unchanged.
+- Quantized block loads use checked fixed-size array views, eliminating repeated
+  per-vector slice checks. Horizontal reductions stay in SIMD registers, and
+  single-position Q4_0/Q8_0 dots use four independent FMA accumulators.
+- The F32 router loads unaligned mmap bytes directly into AVX2 registers instead
+  of scalar decoding. RoPE rotations use eight lanes with scalar tails; their
+  multiply/add order is retained without introducing approximate trigonometry.
+  Unsupported CPUs and general router dimensions retain portable fallbacks.
+
+Three **alternating before/after runs** of the same real-model harness above on
+the i7-4790T (64 MiB, eight workers/compute slots, no CPU profiling during these
+runs, cache retention disabled) measured these medians:
+
+| Measurement | Previous optimized version | Additional SIMD changes |
+| --- | ---: | ---: |
+| Prefill wall time | 20.778 s | 20.329 s |
+| First decode wall time | 3.203 s | 3.132 s |
+| Second decode wall time | 2.435 s | 2.386 s |
+| Sum of inference-phase wall times | 26.446 s | 25.896 s |
+| Sum of inference-phase CPU times | 47.084 s | 43.769 s |
+
+The phase sums are calculated per run before taking their median. These runs
+predicted identical IDs (`30109`, `13`, `200002`), with identical selected expert
+bytes, ranges, mappings and prefetch counts. This is about **2% less wall time and
+7% less CPU time**, not another halving. The prefill still reported roughly
+7 GiB of block input per run; faster arithmetic cannot eliminate streaming I/O.
+No global caches were flushed or CPU frequency pinned. The earlier table is a
+different measurement series; do not attribute changes between series solely to
+these additional kernels. A pairwise Q4 batch experiment was rejected because
+it increased real-model CPU time despite a faster small synthetic benchmark.
+
+Final CLI smoke runs with eight workers and 64 MiB generated `Ja.` in 26.353 s
+for the same short prompt. A separate 24-token arithmetic prompt ran for 51.241 s
+with a five-token generation cap and began with `4`; it has no matching before
+measurement and is not evidence of a speedup or exact instruction following.
+
+New tests cover unaligned F32 router loads, arbitrary offsets, cancellation,
+nonfinite router weights, RoPE tails, and all 65,536 combinations of MXFP4 scale
+and packed byte (bit-exact finite decoding, including signed zero). Existing
+scalar-reference, batch, fallback, integration and race tests are also used.
+
+```sh
+GOEXPERIMENT=simd go test ./forward -run '^TestSIMDKernel' -count=1
+GOEXPERIMENT=simd go test ./forward -run '^$' \
+  -bench '^BenchmarkSIMDKernel' -benchmem -benchtime=500ms -count=3
+GODEBUG=cpu.avx2=off,cpu.fma=off GOEXPERIMENT=simd \
+  go test ./forward ./tests -run '^(TestSIMDKernel|TestMXFP4|TestSparseMoE|TestForwardMoEBatch|TestQuant|TestRoPE|TestPrefill)' -count=1
+```
+
+The warm, one-worker MXFP4 microbenchmark uses 64 output rows and 2,880 inputs;
+final three-run medians were 54.4/79.4/159.0/308.8/581.9 microseconds for
+1/2/4/8/16 routed positions. Groups of up to four allocate no row scratch in
+this kernel; larger groups allocate one reusable row per worker invocation.
+These microseconds are not full-model token timings.
 
 ## Memory and throughput limits
 

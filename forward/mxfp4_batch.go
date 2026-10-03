@@ -66,6 +66,9 @@ func computeMoEBatchExpertRows(ctx context.Context, data []byte, input int,
 		}
 		return
 	}
+	if computeMoEBatchPairFast(ctx, data, input, x, xOffsets, bias, y, yOffsets, begin, end) {
+		return
+	}
 	weights := make([]float32, input)
 	for row := begin; row < end; row++ {
 		if ctx.Err() != nil {

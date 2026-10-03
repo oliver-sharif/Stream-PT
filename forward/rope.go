@@ -50,7 +50,7 @@ func ApplyRoPE(
 	// Apply to Q heads.
 	for h := 0; h < numHeads; h++ {
 		head := q[h*headDim : (h+1)*headDim]
-		for i := 0; i < halfDim; i++ {
+		for i := rotateRoPEFast(head, cosTable, sinTable); i < halfDim; i++ {
 			x0 := head[i]
 			x1 := head[i+halfDim]
 			c := cosTable[i]
@@ -63,7 +63,7 @@ func ApplyRoPE(
 	// Apply to KV heads.
 	for h := 0; h < numKVHeads; h++ {
 		head := k[h*headDim : (h+1)*headDim]
-		for i := 0; i < halfDim; i++ {
+		for i := rotateRoPEFast(head, cosTable, sinTable); i < halfDim; i++ {
 			x0 := head[i]
 			x1 := head[i+halfDim]
 			c := cosTable[i]
