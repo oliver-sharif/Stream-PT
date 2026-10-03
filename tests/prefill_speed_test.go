@@ -43,10 +43,10 @@ func prefillEngineFixture(t *testing.T) *Engine {
 	norm := add("norm", 0, []uint64{dim}, f32(ones))
 	embeddings := make([]byte, vocab*q40BlockBytes)
 	head := make([]byte, vocab*34)
-	for row := 0; row < vocab; row++ {
+	for row := range vocab {
 		binary.LittleEndian.PutUint16(embeddings[row*q40BlockBytes:], 0x3c00)
 		binary.LittleEndian.PutUint16(head[row*34:], 0x3c00)
-		for i := 0; i < dim; i++ {
+		for i := range dim {
 			value := int8(1)
 			if row == 1 || row == 2 && i >= dim/2 {
 				value = -1
@@ -59,7 +59,7 @@ func prefillEngineFixture(t *testing.T) *Engine {
 	tokenEmbd := add("token_embd.weight", 2, []uint64{dim, vocab}, embeddings)
 	outputWeight := add("output.weight", 8, []uint64{dim, vocab}, head)
 	identity := make([]byte, dim*q40BlockBytes)
-	for row := 0; row < dim; row++ {
+	for row := range dim {
 		block := identity[row*q40BlockBytes : (row+1)*q40BlockBytes]
 		binary.LittleEndian.PutUint16(block, 0x3c00)
 		for i := 2; i < len(block); i++ {
@@ -70,7 +70,7 @@ func prefillEngineFixture(t *testing.T) *Engine {
 	projection := add("projection", 2, []uint64{dim, dim}, identity)
 	router := add("router", 0, []uint64{dim, 1}, f32(make([]float32, dim)))
 	expertData := make([]byte, dim*mxfp4BlockBytes)
-	for row := 0; row < dim; row++ {
+	for row := range dim {
 		expertData[row*mxfp4BlockBytes] = 127
 	}
 	expert := add("expert", 39, []uint64{dim, dim, 1}, expertData)

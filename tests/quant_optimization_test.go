@@ -80,7 +80,7 @@ func TestQuantOptimizationFloat16Scales(t *testing.T) {
 			if typ == 8 {
 				weight = 1
 			}
-			for row := 0; row < output; row++ {
+			for row := range output {
 				encoded := data[row*rowBytes : (row+1)*rowBytes]
 				binary.LittleEndian.PutUint16(encoded, uint16(row))
 				for i := 2; i < rowBytes; i++ {
@@ -189,7 +189,7 @@ func TestQuantOptimizationArgmaxWindowAndTies(t *testing.T) {
 	for _, best := range []int{0, 3} {
 		if best == 3 {
 			clear(data)
-			for row := 0; row < 17; row++ {
+			for row := range 17 {
 				binary.LittleEndian.PutUint16(data[row*34:], 0x3c00)
 			}
 			for _, row := range []int{3, 4, 8, 16} {
@@ -201,7 +201,7 @@ func TestQuantOptimizationArgmaxWindowAndTies(t *testing.T) {
 		wantLogit := x[0]
 		for _, workers := range []int{1, 4, 100} {
 			for _, rows := range []int{1, 4, 8, 17} {
-				for repeat := 0; repeat < 5; repeat++ {
+				for range 5 {
 					token, logit, err := forward.MulQ80Argmax(context.Background(), reader, tensor, x,
 						forward.Q40Options{Workers: workers, WindowBytes: uint64(rows * 34)})
 					if err != nil || token != best || logit != wantLogit {
@@ -304,7 +304,7 @@ func TestQuantOptimizationCancellationJoins(t *testing.T) {
 			opts := forward.Q40Options{Workers: 4, WindowBytes: uint64(4 * blockBytes)}
 			result := make(chan error, 1)
 			go func() { result <- quantOptimizationRun(ctx, reader, tensor, x, y, mode, opts) }()
-			for i := 0; i < 4; i++ {
+			for range 4 {
 				select {
 				case <-ctx.entered:
 				case <-time.After(5 * time.Second):

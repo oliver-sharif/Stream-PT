@@ -29,23 +29,23 @@ func TestQuantizedSIMDReference(t *testing.T) {
 			data := make([]byte, output*rowBytes)
 			want := make([]float32, output)
 			fp4 := [...]float32{0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6}
-			for row := 0; row < output; row++ {
+			for row := range output {
 				var sum float64
-				for block := 0; block < input/32; block++ {
+				for block := range input / 32 {
 					encoded := data[row*rowBytes+block*blockBytes : row*rowBytes+(block+1)*blockBytes]
 					var scale float32
 					if typ == 8 {
 						bits := [...]uint16{0x3c00, 0xb800, 0x3400, 0x0001, 0x0400}[block%5]
 						binary.LittleEndian.PutUint16(encoded, bits)
 						scale = referenceFloat16(bits)
-						for i := 0; i < 32; i++ {
+						for i := range 32 {
 							encoded[2+i] = byte(row*31 + block*13 + i*7)
 							sum += float64(scale*float32(int8(encoded[2+i]))) * float64(x[block*32+i])
 						}
 					} else {
 						encoded[0] = byte(120 + block%15)
 						scale = float32(math.Ldexp(1, int(encoded[0])-127))
-						for i := 0; i < 16; i++ {
+						for i := range 16 {
 							encoded[1+i] = byte(row*31 + block*13 + i*7)
 							sum += float64(scale*fp4[encoded[1+i]&15]) * float64(x[block*32+i])
 							sum += float64(scale*fp4[encoded[1+i]>>4]) * float64(x[block*32+i+16])
@@ -104,7 +104,7 @@ func TestAttentionSIMDReference(t *testing.T) {
 				for i := range q {
 					q[i] = float32(i%17-8) / 16
 				}
-				for pos := 0; pos < positions; pos++ {
+				for pos := range positions {
 					for i := range k {
 						k[i] = float32((i+pos)%19-9) / 16
 						v[i] = float32((i+pos)%23-11) / 16
@@ -116,12 +116,12 @@ func TestAttentionSIMDReference(t *testing.T) {
 					if window > 0 {
 						start = max(0, pos-window+1)
 					}
-					for h := 0; h < heads; h++ {
+					for h := range heads {
 						scores := make([]float64, pos+1)
 						maxScore := float64(options.Sinks[h])
 						for p := start; p <= pos; p++ {
 							var dot float64
-							for i := 0; i < dim; i++ {
+							for i := range dim {
 								dot += float64(q[h*dim+i]) * float64(cache.Keys[0][p][(h/2)*dim+i])
 							}
 							scores[p] = dot / math.Sqrt(float64(dim))
@@ -132,7 +132,7 @@ func TestAttentionSIMDReference(t *testing.T) {
 							scores[p] = math.Exp(scores[p] - maxScore)
 							sum += scores[p]
 						}
-						for i := 0; i < dim; i++ {
+						for i := range dim {
 							var value float64
 							for p := start; p <= pos; p++ {
 								value += scores[p] / sum * float64(cache.Values[0][p][h/2*dim+i])

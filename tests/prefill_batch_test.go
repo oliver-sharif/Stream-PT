@@ -76,7 +76,7 @@ func batchEngineFixture(t testing.TB) *Engine {
 	e.TokenEmbd = quant("embedding", 2, []uint64{dim, vocab}, 1)
 	e.OutputWeight = quant("output", 8, []uint64{dim, vocab}, 7)
 	e.OutputNorm = floats("norm", []uint64{dim}, 5)
-	for layer := 0; layer < layers; layer++ {
+	for layer := range layers {
 		lw := LayerWeights{
 			AttnNorm: floats("norm", []uint64{dim}, layer), PostAttnNorm: floats("norm", []uint64{dim}, layer+1),
 			AttnQ: quant("q", 2, []uint64{dim, dim}, layer), AttnK: quant("k", 2, []uint64{dim, kvHeads * headDim}, layer+2),
@@ -166,7 +166,7 @@ func TestPrefillBatchCausalAndAppend(t *testing.T) {
 		t.Fatal(err)
 	}
 	for layer := range full.KVCache.Keys {
-		for pos := 0; pos < 3; pos++ {
+		for pos := range 3 {
 			compareVectors(t, full.KVCache.Keys[layer][pos], split.KVCache.Keys[layer][pos])
 			compareVectors(t, full.KVCache.Values[layer][pos], split.KVCache.Values[layer][pos])
 		}
@@ -274,7 +274,7 @@ func TestAttentionScratchNoAllocations(t *testing.T) {
 	for i := range q {
 		q[i] = float32(i%5-2) / 8
 	}
-	for pos := 0; pos < 16; pos++ {
+	for pos := range 16 {
 		for i := range k {
 			cache.Keys[0][pos][i] = float32((i+pos)%7-3) / 8
 			cache.Values[0][pos][i] = float32((i+pos)%9-4) / 8

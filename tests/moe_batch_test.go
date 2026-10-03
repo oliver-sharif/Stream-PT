@@ -29,8 +29,8 @@ func moeBatchFixture(tb testing.TB, hidden, expertDim, experts, topK, biasType i
 			Range: ggufindex.Range{File: path, Start: uint64(start), End: uint64(len(data))}}
 	}
 	router := make([]byte, hidden*experts*4)
-	for e := 0; e < experts; e++ {
-		for i := 0; i < hidden; i++ {
+	for e := range experts {
+		for i := range hidden {
 			value := float32((e*7+i*3)%19-9) / 32
 			switch routerMode {
 			case "ties":
@@ -112,7 +112,7 @@ func moeBatchFixture(tb testing.TB, hidden, expertDim, experts, topK, biasType i
 }
 
 func moeBatchSequential(ctx context.Context, reader *ggufmmap.Reader, x []float32, cfg *forward.Config, lw *forward.LayerWeights, out []float32, batch int, options forward.Q40Options) error {
-	for token := 0; token < batch; token++ {
+	for token := range batch {
 		if err := forward.ForwardMoE(ctx, reader, x[token*cfg.HiddenDim:(token+1)*cfg.HiddenDim], cfg,
 			lw.FFNGateInp, lw.FFNGateInpBias, lw.FFNGateExps, lw.FFNGateExpsBias,
 			lw.FFNUpExps, lw.FFNUpExpsBias, lw.FFNDownExps, lw.FFNDownExpsBias,

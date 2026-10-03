@@ -33,7 +33,7 @@ func TestDotQ40TwoBlocks(t *testing.T) {
 	row := make([]byte, 2*q40BlockBytes)
 
 	// Both blocks have scale 1 and only nibbles 8 (zero weights).
-	for block := 0; block < 2; block++ {
+	for block := range 2 {
 		begin := block * q40BlockBytes
 		binary.LittleEndian.PutUint16(row[begin:begin+2], 0x3c00)
 		for i := begin + 2; i < begin+q40BlockBytes; i++ {

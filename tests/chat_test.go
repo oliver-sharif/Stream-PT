@@ -63,7 +63,7 @@ func TestGenerateStopsAtGPTOSSCompletion(t *testing.T) {
 			Range: ggufindex.Range{File: path, Start: uint64(start), End: uint64(len(data))}}
 	}
 	embeddings := make([]byte, vocab*18)
-	for id := 0; id < vocab; id++ {
+	for id := range vocab {
 		binary.LittleEndian.PutUint16(embeddings[id*18:], 0x3c00)
 		for i := 2; i < 18; i++ {
 			embeddings[id*18+i] = 0x88
@@ -72,7 +72,7 @@ func TestGenerateStopsAtGPTOSSCompletion(t *testing.T) {
 	}
 	embd := add(2, []uint64{dim, vocab}, embeddings)
 	norms := make([]byte, dim*4)
-	for i := 0; i < dim; i++ {
+	for i := range dim {
 		binary.LittleEndian.PutUint32(norms[i*4:], math.Float32bits(1))
 	}
 	norm := add(0, []uint64{dim}, norms)

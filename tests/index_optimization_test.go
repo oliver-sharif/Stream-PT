@@ -158,7 +158,7 @@ func TestIndexOptimizationNestingLimit(t *testing.T) {
 				if empty {
 					value = indexOptimizationArray(0, 0, nil)
 				}
-				for i := 0; i < wrappers; i++ {
+				for range wrappers {
 					value = indexOptimizationArray(9, 1, value)
 				}
 				path, _ := indexOptimizationFixture(t, indexOptimizationEntry{key: "array", typ: 9, value: value})

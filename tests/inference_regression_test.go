@@ -62,13 +62,13 @@ func TestGPTOSSExpertBiasesAndSwiGLU(t *testing.T) {
 	router := add("router", 0, []uint64{dim, experts}, f32(make([]float32, dim*experts)))
 	routerBias := add("router.bias", 0, []uint64{experts}, f32([]float32{0, 1}))
 	zeroWeights := make([]byte, experts*dim*mxfp4BlockBytes)
-	for block := 0; block < experts*dim; block++ {
+	for block := range experts * dim {
 		zeroWeights[block*mxfp4BlockBytes] = 127
 	}
 	gate := add("gate", 39, []uint64{dim, dim, experts}, zeroWeights)
 	up := add("up", 39, []uint64{dim, dim, experts}, zeroWeights)
 	downWeights := append([]byte(nil), zeroWeights...)
-	for row := 0; row < experts*dim; row++ {
+	for row := range experts * dim {
 		downWeights[row*mxfp4BlockBytes+1] = 2 // First coefficient is 1.
 	}
 	down := add("down", 39, []uint64{dim, dim, experts}, downWeights)

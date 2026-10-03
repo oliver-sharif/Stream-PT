@@ -123,7 +123,7 @@ func cpuModel() string {
 		return runtime.GOARCH
 	}
 
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if key, value, ok := strings.Cut(line, ":"); ok && strings.TrimSpace(key) == "model name" {
 			return strings.TrimSpace(value)
 		}

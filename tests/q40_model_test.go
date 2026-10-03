@@ -117,7 +117,7 @@ func referenceQ40Dot(row []byte, x []float32) float32 {
 		b := row[block*q40BlockBytes : (block+1)*q40BlockBytes]
 		scale := referenceFloat16(binary.LittleEndian.Uint16(b[:2]))
 
-		for i := 0; i < 16; i++ {
+		for i := range 16 {
 			packed := b[2+i]
 			low := int(packed&0x0f) - 8
 			high := int(packed>>4) - 8

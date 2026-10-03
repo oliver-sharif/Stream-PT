@@ -86,7 +86,7 @@ func BenchmarkForwardAttention(b *testing.B) {
 			for i := range q {
 				q[i] = float32(i%17-8) / 16
 			}
-			for p := 0; p < positions; p++ {
+			for p := range positions {
 				for i := range k {
 					cache.Keys[0][p][i] = float32((i+p)%19-9) / 16
 					cache.Values[0][p][i] = float32((i+p)%23-11) / 16

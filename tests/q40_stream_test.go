@@ -83,8 +83,8 @@ func TestMulQ40StreamingBatch(t *testing.T) {
 						x[i] = float32(i%23-11) / 32
 					}
 					original := append([]float32(nil), x...)
-					for item := 0; item < batch; item++ {
-						for row := 0; row < output; row++ {
+					for item := range batch {
+						for row := range output {
 							want[item*output+row] = referenceQ40Dot(data[row*rowBytes:(row+1)*rowBytes], x[item*input:(item+1)*input])
 						}
 					}

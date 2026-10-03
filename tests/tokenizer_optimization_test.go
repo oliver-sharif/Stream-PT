@@ -141,7 +141,7 @@ func TestTokenizerOptimizationFallback(t *testing.T) {
 
 func TestTokenizerOptimizationReference(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
-	for vocab := 0; vocab < 8; vocab++ {
+	for vocab := range 8 {
 		var tokens []string
 		for range 80 {
 			text := make([]byte, rng.Intn(12)+1)

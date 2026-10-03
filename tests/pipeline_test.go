@@ -149,7 +149,7 @@ func TestQ80Dot(t *testing.T) {
 	row := make([]byte, 34)
 	// Scale = 1.0 (fp16 0x3c00)
 	binary.LittleEndian.PutUint16(row[:2], 0x3c00)
-	for i := 0; i < elements; i++ {
+	for i := range elements {
 		row[2+i] = byte(int8(i - 16))
 	}
 
@@ -165,7 +165,7 @@ func TestQ80Dot(t *testing.T) {
 	}
 	got := y[0]
 	var want float32
-	for i := 0; i < elements; i++ {
+	for i := range elements {
 		want += float32(int8(row[2+i]))
 	}
 
@@ -179,7 +179,7 @@ func TestMXFP4Dot(t *testing.T) {
 	row := make([]byte, 17)
 	// Scale = 127 -> 2^(127-127) = 1.0
 	row[0] = 127
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		row[1+i] = 0x22 // 0x2 = 1.0 for low and high nibble
 	}
 
