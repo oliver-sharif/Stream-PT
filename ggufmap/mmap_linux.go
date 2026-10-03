@@ -16,13 +16,14 @@ import (
 // file can cause a fatal fault. Mapped pages still consume physical RAM through
 // the OS page cache, even though they are not allocated on the Go heap.
 type Reader struct {
-	files         map[string]*os.File
-	mu            sync.Mutex
-	used          bool
-	closed        bool
-	expertOptions ExpertCacheOptions
-	expertStats   ExpertCacheStats
-	expertCache   map[ggufindex.Range][]byte
+	files           map[string]*os.File
+	mu              sync.Mutex
+	used            bool
+	closed          bool
+	expertOptions   ExpertCacheOptions
+	expertStats     ExpertCacheStats
+	expertCache     map[ggufindex.Range][]byte
+	expertLookahead bool
 }
 
 // DefaultExpertCoalesceBytes bounds selected bytes in a coalesced mapping.
@@ -84,6 +85,18 @@ func (r *Reader) ConfigureExpertCache(options ExpertCacheOptions) error {
 	return nil
 }
 
+// ConfigureExpertLookahead controls one selected run of prefetch lookahead (on by default).
+// Configure before use. At most two transient expert runs are mapped per call.
+func (r *Reader) ConfigureExpertLookahead(enabled bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.used || r.closed {
+		return fmt.Errorf("expert lookahead must be configured before use")
+	}
+	r.expertLookahead = enabled
+	return nil
+}
+
 // ExpertCacheStats returns a snapshot safe to inspect or modify independently.
 func (r *Reader) ExpertCacheStats() ExpertCacheStats {
 	r.mu.Lock()
@@ -104,7 +117,7 @@ func Open(model *ggufindex.Model) (*Reader, error) {
 		return nil, fmt.Errorf("nil model")
 	}
 
-	r := &Reader{files: make(map[string]*os.File, len(model.Paths))}
+	r := &Reader{files: make(map[string]*os.File, len(model.Paths)), expertLookahead: true}
 	for _, path := range model.Paths {
 		f, err := os.Open(path)
 		if err != nil {
@@ -310,6 +323,9 @@ func mmapFileRange(f *os.File, span ggufindex.Range) ([]byte, uint64, error) {
 // selected ranges share a mapping up to DefaultExpertCoalesceBytes; gaps are
 // never bridged. MADV_RANDOM avoids speculative readahead. No whole tensor is
 // read. Calls and statistics may run concurrently, but Close must not.
+// By default the next selected run is prefetched before the current callbacks,
+// overlapping its kernel I/O with current computation. Both mappings are released
+// on callback error or panic unless admitted to the optional hot cache.
 // An empty selection succeeds without invoking fn, which may then be nil.
 func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, data []byte) error) error {
 	if len(ranges) == 0 {
@@ -326,6 +342,7 @@ func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, d
 	r.mu.Lock()
 	r.used = true
 	closed := r.closed
+	lookahead := r.expertLookahead
 	r.mu.Unlock()
 	if closed {
 		return fmt.Errorf("reader is closed")
@@ -360,7 +377,13 @@ func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, d
 		}
 	}
 	r.mu.Unlock()
-	for first := 0; first < len(selected); {
+	type expertRun struct {
+		span       ggufindex.Range
+		first, end int
+		data       []byte
+		release    func() error
+	}
+	prepare := func(first int) (expertRun, error) {
 		end := first + 1
 		run := selected[first].span
 		for end < len(selected) {
@@ -384,24 +407,50 @@ func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, d
 		r.mu.Unlock()
 		data, release, err := r.mapExpertRun(selected[first].file, run, hot)
 		if err != nil {
-			return fmt.Errorf("expert run %v: %w", run, err)
+			return expertRun{}, fmt.Errorf("expert run %v: %w", run, err)
 		}
-		err = func() (err error) {
-			defer func() { err = errors.Join(err, release()) }()
-			for _, item := range selected[first:end] {
-				start, stop := int(item.span.Start-run.Start), int(item.span.End-run.Start)
-				if err := fn(item.index, data[start:stop:stop]); err != nil {
+		return expertRun{span: run, first: first, end: end, data: data, release: release}, nil
+	}
+	return func() (err error) {
+		var current, next expertRun
+		defer func() {
+			if current.release != nil {
+				err = errors.Join(err, current.release())
+			}
+			if next.release != nil {
+				err = errors.Join(err, next.release())
+			}
+		}()
+		for first := 0; first < len(selected); {
+			if next.release != nil {
+				current, next = next, expertRun{}
+			} else {
+				current, err = prepare(first)
+				if err != nil {
 					return err
 				}
 			}
-			return nil
-		}()
-		if err != nil {
-			return err
+			if lookahead && current.end < len(selected) {
+				next, err = prepare(current.end)
+				if err != nil {
+					return err
+				}
+			}
+			for _, item := range selected[current.first:current.end] {
+				start, stop := int(item.span.Start-current.span.Start), int(item.span.End-current.span.Start)
+				if err := fn(item.index, current.data[start:stop:stop]); err != nil {
+					return err
+				}
+			}
+			err = current.release()
+			current.release = nil
+			if err != nil {
+				return err
+			}
+			first = current.end
 		}
-		first = end
-	}
-	return nil
+		return nil
+	}()
 }
 
 func (r *Reader) mapExpertRun(f *os.File, span ggufindex.Range, hot bool) ([]byte, func() error, error) {

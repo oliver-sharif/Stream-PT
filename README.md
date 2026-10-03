@@ -69,6 +69,7 @@ A CLI-only build does not require Fyne's native OpenGL/X11 development dependenc
 | `-expert-cache-mb` | — | `0` | Page-rounded budget for locked hot expert mappings; zero disables retention. |
 | `-expert-cache-min-uses` | — | `8` | Selected matrix passes before cache admission; zero admits on first use. |
 | `-expert-stats` | — | `false` | Track matrix-range frequencies and report selected bytes, mapping runs, cache hits and the eight hottest ranges. |
+| `-no-expert-lookahead` | — | `false` | Disable next-selected-run prefetch to compare with the single-run streaming path. |
 
 The window is not a total RAM limit: MXFP4 computation maps selected expert runs
 (see below), and activations, tokenizer data, KV cache, and the OS page
@@ -387,17 +388,27 @@ Expert biases are also read only for selected experts.
 
 `Reader.WithExpertRanges` merges **exactly adjacent selected** ranges, never gaps
 containing unselected experts. Merged runs are capped at 32 MiB; a single larger
-expert matrix is mapped on its own. Only one run is active at a time, plus an
-optional bias mapping and retained hot runs. Mappings are read-only, zero-copy,
-and released after all row workers finish. Linux `MADV_RANDOM` suppresses speculative
-readahead; page-aligned `MADV_WILLNEED` requests cover the current selected run in
-128 KiB pieces, without requesting the next unselected expert. One large
+expert matrix is mapped on its own. By default each call holds at most two transient
+runs: the current run and the next **selected** run, plus an optional bias mapping
+and retained hot runs. The next run is mapped and prefetched before the current
+callbacks so kernel I/O can overlap their computation; no prefetch goroutine or
+worker pool is added. Both transient mappings are released on callback error or
+panic. Mappings are read-only, zero-copy, and released after all row workers finish.
+Linux `MADV_RANDOM` suppresses speculative readahead; page-aligned `MADV_WILLNEED`
+requests cover each selected run in 128 KiB pieces, without requesting unselected
+experts. One large
 `WILLNEED` request can be truncated to Linux's device readahead/I/O window;
 with `RANDOM` this previously left the rest of a large expert to demand faults.
 Both are best-effort hints, not a residency guarantee; smaller device windows or
 memory pressure can still limit prefetch. Page alignment can share boundary pages
 with an unselected expert: byte-exact physical disk I/O cannot be guaranteed.
 Q4_0/Q8_0 retain their separate sequential streaming-window policy.
+
+`Reader.ConfigureExpertLookahead(false)` before first use (or CLI
+`-no-expert-lookahead`) restores the single-active-run path. This bounds active
+mappings, not the OS page cache; two oversized individual matrices can exceed
+64 MiB. An early callback error can leave the next selected run prefetched in the
+OS cache even though it was never computed.
 
 SIMD/FMA and goroutines remain in the matrix kernels. The one-input path computes
 directly from quantized blocks. On AVX2/FMA, groups of two to four routed positions
@@ -593,6 +604,27 @@ final three-run medians were 54.4/79.4/159.0/308.8/581.9 microseconds for
 1/2/4/8/16 routed positions. Groups of up to four allocate no row scratch in
 this kernel; larger groups allocate one reusable row per worker invocation.
 These microseconds are not full-model token timings.
+
+### Selected-run lookahead measurements
+
+Alternating real `Engine.Generate` A/B runs on the same i7-4790T / GPT-OSS-120B,
+64 MiB dense windows, with one warmup per variant excluded, measured:
+
+| Prompt / output | Workers | Measured pairs | Single-run median | Lookahead median | Reduction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `Hallo, sag nur Ja!` / `Ja.` | 8 | 3 | 30.145 s | 27.441 s | 8.97% |
+| Count to ten / 8-token cap | 8 | 2 | 55.697 s | 50.935 s | 8.55% |
+| `Hallo, sag nur Ja!` / `Ja.` | 4 | 3 | 32.732 s | 29.161 s | 10.91% |
+
+All variants produced bit-identical final activations and populated KV state,
+identical tokens and text. The count prompt produced `1, ... ... ... ... ... ...`
+in both variants; this is a performance/correctness comparison, not evidence of
+improved instruction following. No constants cache, weight retention or new
+worker pool was used. Most of the gain is in prefill; decode was not consistently
+faster. OS caches were not flushed, CPU frequency was not pinned, and disk input
+remained substantial. Compare paired runs, not these absolute times with older
+tables or an isolated 27-second CLI run. Details, raw-log paths and reproduction
+commands are in [PERFORMANCE.md](PERFORMANCE.md).
 
 ## Memory and throughput limits
 

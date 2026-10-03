@@ -66,6 +66,10 @@ func expertAssertUnmapped(t *testing.T, paths []string) {
 
 func TestWithExpertRangesPhysicalOrder(t *testing.T) {
 	r, paths, contents := expertReader(t, 3*os.Getpagesize()+137)
+	// Keep the single-run path covered separately from TestExpertLookahead.
+	if err := r.ConfigureExpertLookahead(false); err != nil {
+		t.Fatal(err)
+	}
 	if err := r.ConfigureExpertCache(ExpertCacheOptions{TrackStats: true}); err != nil {
 		t.Fatal(err)
 	}
@@ -197,6 +201,9 @@ func TestWithExpertRangesValidationBeforeCallback(t *testing.T) {
 
 func TestWithExpertRangesCallbackCleanup(t *testing.T) {
 	r, paths, _ := expertReader(t, 256)
+	if err := r.ConfigureExpertLookahead(false); err != nil {
+		t.Fatal(err)
+	}
 	ranges := []ggufindex.Range{
 		{File: paths[0], Start: 17, End: 32},
 		{File: paths[0], Start: 32, End: 64},
