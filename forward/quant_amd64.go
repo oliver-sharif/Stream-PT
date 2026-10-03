@@ -25,7 +25,7 @@ func quantDotQ80(row []byte, x []float32) float32 {
 // Widen packed bytes in registers; neither kernel materializes int32 weights.
 // AVX2 also serves as the narrow path on AVX512 machines.
 func quantQ40WeightsAVX2(q []byte, scale archsimd.Float32x8) (archsimd.Float32x8, archsimd.Float32x8, archsimd.Float32x8, archsimd.Float32x8) {
-	packed := archsimd.LoadUint8x16(q)
+	packed := archsimd.LoadUint8x16((*[16]byte)(q)[:])
 	a := packed.ExtendLo8ToUint32()
 	b := packed.ConcatShiftBytesRight(packed, 8).ExtendLo8ToUint32()
 	mask := archsimd.BroadcastUint32x8(15)
@@ -37,48 +37,44 @@ func quantQ40WeightsAVX2(q []byte, scale archsimd.Float32x8) (archsimd.Float32x8
 }
 
 func quantQ40AVX2(row []byte, x []float32) float32 {
-	var accumulator archsimd.Float32x8
+	var a0, a1, a2, a3 archsimd.Float32x8
 	for block := 0; block < len(row)/q40BlockBytes; block++ {
-		encoded := row[block*q40BlockBytes : (block+1)*q40BlockBytes]
-		scale := archsimd.BroadcastUint32x8(quantFloat16Bits(binary.LittleEndian.Uint16(encoded))).AsFloat32x8()
+		encoded := (*[q40BlockBytes]byte)(row[block*q40BlockBytes:])
+		scale := archsimd.BroadcastUint32x8(quantFloat16Bits(binary.LittleEndian.Uint16(encoded[:]))).AsFloat32x8()
 		w0, w1, w2, w3 := quantQ40WeightsAVX2(encoded[2:], scale)
-		input := x[block*32 : (block+1)*32]
-		accumulator = w0.MulAdd(archsimd.LoadFloat32x8(input[:8]), accumulator)
-		accumulator = w1.MulAdd(archsimd.LoadFloat32x8(input[8:16]), accumulator)
-		accumulator = w2.MulAdd(archsimd.LoadFloat32x8(input[16:24]), accumulator)
-		accumulator = w3.MulAdd(archsimd.LoadFloat32x8(input[24:]), accumulator)
+		input := (*[32]float32)(x[block*32:])
+		a0 = w0.MulAdd(archsimd.LoadFloat32x8(input[:8]), a0)
+		a1 = w1.MulAdd(archsimd.LoadFloat32x8(input[8:16]), a1)
+		a2 = w2.MulAdd(archsimd.LoadFloat32x8(input[16:24]), a2)
+		a3 = w3.MulAdd(archsimd.LoadFloat32x8(input[24:]), a3)
 	}
-	return quantSumAVX2(accumulator)
+	return quantSumAVX2(a0.Add(a1).Add(a2).Add(a3))
 }
 
 func quantQ80AVX2(row []byte, x []float32) float32 {
-	var accumulator archsimd.Float32x8
+	var a0, a1, a2, a3 archsimd.Float32x8
 	for block := 0; block < len(row)/q80BlockBytes; block++ {
-		encoded := row[block*q80BlockBytes : (block+1)*q80BlockBytes]
-		scale := archsimd.BroadcastUint32x8(quantFloat16Bits(binary.LittleEndian.Uint16(encoded))).AsFloat32x8()
+		encoded := (*[q80BlockBytes]byte)(row[block*q80BlockBytes:])
+		scale := archsimd.BroadcastUint32x8(quantFloat16Bits(binary.LittleEndian.Uint16(encoded[:]))).AsFloat32x8()
 		packed0 := archsimd.LoadUint8x16(encoded[2:18])
 		packed1 := archsimd.LoadUint8x16(encoded[18:])
 		w0 := packed0.AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(scale)
 		w1 := packed0.ConcatShiftBytesRight(packed0, 8).AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(scale)
 		w2 := packed1.AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(scale)
 		w3 := packed1.ConcatShiftBytesRight(packed1, 8).AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(scale)
-		input := x[block*32 : (block+1)*32]
-		accumulator = w0.MulAdd(archsimd.LoadFloat32x8(input[:8]), accumulator)
-		accumulator = w1.MulAdd(archsimd.LoadFloat32x8(input[8:16]), accumulator)
-		accumulator = w2.MulAdd(archsimd.LoadFloat32x8(input[16:24]), accumulator)
-		accumulator = w3.MulAdd(archsimd.LoadFloat32x8(input[24:]), accumulator)
+		input := (*[32]float32)(x[block*32:])
+		a0 = w0.MulAdd(archsimd.LoadFloat32x8(input[:8]), a0)
+		a1 = w1.MulAdd(archsimd.LoadFloat32x8(input[8:16]), a1)
+		a2 = w2.MulAdd(archsimd.LoadFloat32x8(input[16:24]), a2)
+		a3 = w3.MulAdd(archsimd.LoadFloat32x8(input[24:]), a3)
 	}
-	return quantSumAVX2(accumulator)
+	return quantSumAVX2(a0.Add(a1).Add(a2).Add(a3))
 }
 
 func quantSumAVX2(accumulator archsimd.Float32x8) float32 {
-	var partials [8]float32
-	accumulator.StoreArray(&partials)
-	var sum float32
-	for _, partial := range partials {
-		sum += partial
-	}
-	return sum
+	pairs := accumulator.GetLo().Add(accumulator.GetHi())
+	pairs = pairs.ConcatAddPairs(pairs)
+	return pairs.ConcatAddPairs(pairs).GetElem(0)
 }
 
 func quantDotQ40Batch(row []byte, x, y []float32, input, output, rowIndex, batch int) {
@@ -91,12 +87,12 @@ func quantDotQ40Batch(row []byte, x, y []float32, input, output, rowIndex, batch
 		count := min(tile, batch-first)
 		var accumulators [tile]archsimd.Float32x8
 		for block := 0; block < len(row)/q40BlockBytes; block++ {
-			encoded := row[block*q40BlockBytes : (block+1)*q40BlockBytes]
-			scale := archsimd.BroadcastUint32x8(quantFloat16Bits(binary.LittleEndian.Uint16(encoded))).AsFloat32x8()
+			encoded := (*[q40BlockBytes]byte)(row[block*q40BlockBytes:])
+			scale := archsimd.BroadcastUint32x8(quantFloat16Bits(binary.LittleEndian.Uint16(encoded[:]))).AsFloat32x8()
 			w0, w1, w2, w3 := quantQ40WeightsAVX2(encoded[2:], scale)
 			for item := 0; item < count; item++ {
 				start := (first+item)*input + block*32
-				v := x[start : start+32]
+				v := (*[32]float32)(x[start:])
 				acc := accumulators[item]
 				acc = w0.MulAdd(archsimd.LoadFloat32x8(v[:8]), acc)
 				acc = w1.MulAdd(archsimd.LoadFloat32x8(v[8:16]), acc)

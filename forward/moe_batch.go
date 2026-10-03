@@ -225,6 +225,9 @@ func validateMoEBatchBias(t ggufindex.Tensor, dim, count int) error {
 }
 
 func routeMoEBatch(ctx context.Context, data []byte, x []float32, s *moeBatchScratch) error {
+	if handled, err := routeMoEBatchFast(ctx, data, x, s); handled {
+		return err
+	}
 	var dummy simd.Float32s
 	lanes := dummy.Len()
 	partials := make([]float32, lanes)
