@@ -10,7 +10,6 @@ import (
 	"sync"
 
 	"Stream-PT/ggufindex"
-	ggufmmap "Stream-PT/ggufmap"
 )
 
 const moeBatchTile = 16
@@ -25,15 +24,6 @@ func validateMoEBatchExpert(t ggufindex.Tensor, input, output, experts int) erro
 		return fmt.Errorf("%q: invalid expert range or overflow", t.Name)
 	}
 	return nil
-}
-
-func withMoEBatchExpert(reader *ggufmmap.Reader, t ggufindex.Tensor, expert int, fn func([]byte) error) error {
-	// Dimensions and the complete range were checked before allocating scratch.
-	size := t.Shape[0] / mxfp4Elements * mxfp4BlockBytes * t.Shape[1]
-	t.Range.Start += uint64(expert) * size
-	t.Range.End = t.Range.Start + size
-	t.Shape = t.Shape[:2]
-	return reader.WithTensor(t, fn)
 }
 
 // mulMoEBatchExpert shares each decoded block between all tokens in a tile.
@@ -66,21 +56,33 @@ func computeMoEBatchExpertRows(ctx context.Context, data []byte, input int,
 	x []float32, xOffsets []int, bias, y []float32, yOffsets []int, begin, end int,
 ) {
 	rowBytes := input / mxfp4Elements * mxfp4BlockBytes
+	if len(xOffsets) == 1 {
+		vector := x[xOffsets[0] : xOffsets[0]+input]
+		for row := begin; row < end; row++ {
+			if ctx.Err() != nil {
+				return
+			}
+			y[yOffsets[0]+row] = dotMXFP4(data[row*rowBytes:(row+1)*rowBytes], vector) + bias[row]
+		}
+		return
+	}
 	weights := make([]float32, input)
 	for row := begin; row < end; row++ {
 		if ctx.Err() != nil {
 			return
 		}
 		rowData := data[row*rowBytes : (row+1)*rowBytes]
-		for block := 0; block < input/mxfp4Elements; block++ {
-			if block%64 == 0 && ctx.Err() != nil {
-				return
-			}
-			encoded := rowData[block*mxfp4BlockBytes : (block+1)*mxfp4BlockBytes]
-			table := &scaledFP4Table[encoded[0]]
-			base := block * mxfp4Elements
-			for i, packed := range encoded[1:] {
-				weights[base+i], weights[base+i+16] = table[packed&15], table[packed>>4]
+		if !decodeMXFP4Fast(rowData, weights) {
+			for block := 0; block < input/mxfp4Elements; block++ {
+				if block%64 == 0 && ctx.Err() != nil {
+					return
+				}
+				encoded := rowData[block*mxfp4BlockBytes : (block+1)*mxfp4BlockBytes]
+				table := &scaledFP4Table[encoded[0]]
+				base := block * mxfp4Elements
+				for i, packed := range encoded[1:] {
+					weights[base+i], weights[base+i+16] = table[packed&15], table[packed>>4]
+				}
 			}
 		}
 		for token, start := range xOffsets {
@@ -90,6 +92,9 @@ func computeMoEBatchExpertRows(ctx context.Context, data []byte, input int,
 }
 
 func dotMoEBatchDecoded(weights, x []float32) float32 {
+	if value, ok := dotMoEBatchDecodedFast(weights, x); ok {
+		return value
+	}
 	var acc simd.Float32s
 	lanes := acc.Len()
 	for block := 0; block < len(weights)/mxfp4Elements; block++ {
@@ -107,7 +112,11 @@ func dotMoEBatchDecoded(weights, x []float32) float32 {
 			acc = w.MulAdd(v, acc)
 		}
 	}
-	partials := make([]float32, lanes)
+	var local [64]float32
+	partials := local[:min(lanes, len(local))]
+	if lanes > len(local) {
+		partials = make([]float32, lanes)
+	}
 	acc.Store(partials)
 	var sum float32
 	for _, p := range partials {

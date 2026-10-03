@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,8 +24,8 @@ func main() {
 	threadsFlag := flag.Int("threads", runtime.GOMAXPROCS(0), "Number of parallel worker goroutines / compute threads")
 	flag.IntVar(threadsFlag, "t", runtime.GOMAXPROCS(0), "Number of parallel worker goroutines (shorthand)")
 
-	windowMBFlag := flag.Int("window-mb", 8, "Streaming mmap chunk window size in MiB")
-	flag.IntVar(windowMBFlag, "w", 8, "Streaming mmap chunk window size in MiB (shorthand)")
+	windowMBFlag := flag.Int("window-mb", 64, "Streaming mmap chunk window size in MiB")
+	flag.IntVar(windowMBFlag, "w", 64, "Streaming mmap chunk window size in MiB (shorthand)")
 
 	maxTokensFlag := flag.Int("max-tokens", 5, "Maximum number of tokens to generate")
 	flag.IntVar(maxTokensFlag, "n", 5, "Maximum number of tokens to generate (shorthand)")
@@ -32,7 +33,14 @@ func main() {
 	promptFlag := flag.String("prompt", "", "Prompt / input text for generation")
 	flag.StringVar(promptFlag, "p", "", "Prompt / input text for generation (shorthand)")
 
+	expertCacheMBFlag := flag.Uint64("expert-cache-mb", 0, "Maximum locked hot-expert cache in MiB (0 disables retention)")
+	expertMinUsesFlag := flag.Uint64("expert-cache-min-uses", 8, "Expert matrix uses before hot-cache admission")
+	expertStatsFlag := flag.Bool("expert-stats", false, "Track and report selected expert matrix frequencies")
+
 	flag.Parse()
+	if *expertCacheMBFlag > ^uint64(0)>>20 {
+		log.Fatal("expert-cache-mb exceeds supported size")
+	}
 
 	paths := []string{
 		"model/gpt-oss-120b-Q4_0-00001-of-00002.gguf",
@@ -53,6 +61,13 @@ func main() {
 			log.Print(err)
 		}
 	}()
+	if err := reader.ConfigureExpertCache(ggufmmap.ExpertCacheOptions{
+		MaxBytes:   *expertCacheMBFlag << 20,
+		MinUses:    *expertMinUsesFlag,
+		TrackStats: *expertStatsFlag,
+	}); err != nil {
+		log.Fatalf("Failed to configure expert cache: %v", err)
+	}
 
 	fmt.Println("╭────────────────────────────────────────────────────────────╮")
 	fmt.Println("│                    SYSTEM & MODELL                         │")
@@ -68,6 +83,7 @@ func main() {
 	if threads <= 0 {
 		threads = runtime.GOMAXPROCS(0)
 	}
+	runtime.GOMAXPROCS(threads)
 
 	windowBytes := uint64(*windowMBFlag) * 1024 * 1024
 	if windowBytes == 0 {
@@ -95,6 +111,7 @@ func main() {
 
 	fmt.Printf("\n--- Streaming Inference Pipeline Ready ---\n")
 	fmt.Printf("Workers (Threads): %d\n", engine.Options.Workers)
+	fmt.Printf("Go compute slots:  %d\n", runtime.GOMAXPROCS(0))
 	fmt.Printf("Chunk Window:      %d MiB\n", engine.Options.WindowBytes/(1024*1024))
 	fmt.Printf("Prompt:            %s\n", prompt)
 
@@ -112,6 +129,31 @@ func main() {
 		return true
 	})
 	fmt.Printf("Inferenzzeit: %s\n", time.Since(inferenceStart).Round(time.Millisecond))
+	if *expertStatsFlag || *expertCacheMBFlag > 0 {
+		stats := reader.ExpertCacheStats()
+		fmt.Printf("Expert weights: %d selected ranges, %.2f MiB; %d mapped runs; %d cache hits; %.2f MiB locked; %d lock failures\n",
+			stats.SelectedRanges, float64(stats.SelectedBytes)/(1<<20), stats.MappedRuns,
+			stats.CacheHits, float64(stats.CachedBytes)/(1<<20), stats.LockFailures)
+		fmt.Printf("Expert prefetch: %d bounded requests; %d failures\n", stats.PrefetchCalls, stats.PrefetchFailures)
+		if *expertStatsFlag {
+			ranges := make([]ggufindex.Range, 0, len(stats.RangeUses))
+			for span := range stats.RangeUses {
+				ranges = append(ranges, span)
+			}
+			sort.Slice(ranges, func(i, j int) bool {
+				if stats.RangeUses[ranges[i]] != stats.RangeUses[ranges[j]] {
+					return stats.RangeUses[ranges[i]] > stats.RangeUses[ranges[j]]
+				}
+				if ranges[i].File != ranges[j].File {
+					return ranges[i].File < ranges[j].File
+				}
+				return ranges[i].Start < ranges[j].Start
+			})
+			for _, span := range ranges[:min(8, len(ranges))] {
+				fmt.Printf("Hot expert matrix: %s [%d,%d), %d uses\n", filepath.Base(span.File), span.Start, span.End, stats.RangeUses[span])
+			}
+		}
+	}
 	if err != nil {
 		log.Printf("Inference step info: %v", err)
 	}

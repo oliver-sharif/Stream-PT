@@ -22,6 +22,8 @@ type moeBatchScratch struct {
 	results                                 []float32
 	gate, up, act                           []float32
 	gateBias, upBias, downBias              []float32
+	ranges                                  []ggufindex.Range
+	jobs                                    []moeProjectionJob
 }
 
 func moeBatchProduct(values ...int) (int, error) {
@@ -45,7 +47,7 @@ func newMoEBatchScratch(cfg *Config, batch int) (*moeBatchScratch, error) {
 	}
 	counts := [][]int{
 		{batch, cfg.HiddenDim}, {batch, cfg.NumExperts}, {batch, cfg.NumExpertsUsed},
-		{batch, cfg.NumExpertsUsed, cfg.HiddenDim}, {min(selections, moeBatchTile), cfg.ExpertHiddenDim},
+		{batch, cfg.NumExpertsUsed, cfg.HiddenDim}, {selections, cfg.ExpertHiddenDim},
 	}
 	sizes := make([]int, len(counts))
 	for i, factors := range counts {
@@ -67,11 +69,12 @@ func newMoEBatchScratch(cfg *Config, batch int) (*moeBatchScratch, error) {
 		selected: make([]ExpertSelection, sizes[2]), heads: make([]int, cfg.NumExperts), next: make([]int, sizes[2]),
 		results: make([]float32, sizes[3]), gate: make([]float32, sizes[4]), up: make([]float32, sizes[4]), act: make([]float32, sizes[4]),
 		gateBias: make([]float32, cfg.ExpertHiddenDim), upBias: make([]float32, cfg.ExpertHiddenDim), downBias: make([]float32, cfg.HiddenDim),
+		ranges: make([]ggufindex.Range, 0, 2*cfg.NumExperts), jobs: make([]moeProjectionJob, 0, 2*cfg.NumExperts),
 	}, nil
 }
 
 // ForwardMoEBatch computes MoE for flattened [batch, HiddenDim] activations.
-// Input and output must not overlap. Expert activation storage is tile bounded.
+// Input and output must not overlap. Only routed experts are mapped, in physical order.
 func ForwardMoEBatch(ctx context.Context, reader *ggufmmap.Reader, x []float32, cfg *Config,
 	lw *LayerWeights, out []float32, batch int, options Q40Options,
 ) error {
@@ -160,32 +163,8 @@ func forwardMoEBatch(ctx context.Context, reader *ggufmmap.Reader, x []float32, 
 			scratch.heads[sel.Index] = idx
 		}
 	}
-	for expert, head := range scratch.heads {
-		if head < 0 {
-			continue
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := readExpertBias(reader, lw.FFNGateExpsBias, expert, experts, scratch.gateBias); err != nil {
-			return err
-		}
-		if err := readExpertBias(reader, lw.FFNUpExpsBias, expert, experts, scratch.upBias); err != nil {
-			return err
-		}
-		if err := readExpertBias(reader, lw.FFNDownExpsBias, expert, experts, scratch.downBias); err != nil {
-			return err
-		}
-		err := withMoEBatchExpert(reader, lw.FFNGateExps, expert, func(gate []byte) error {
-			return withMoEBatchExpert(reader, lw.FFNUpExps, expert, func(up []byte) error {
-				return withMoEBatchExpert(reader, lw.FFNDownExps, expert, func(down []byte) error {
-					return evaluateMoEBatchExpert(ctx, gate, up, down, x, head, scratch, options)
-				})
-			})
-		})
-		if err != nil {
-			return fmt.Errorf("expert %d: %w", expert, err)
-		}
+	if err := evaluateSelectedMoE(ctx, reader, lw, x, scratch, options); err != nil {
+		return err
 	}
 	clear(out)
 	var dummy simd.Float32s
@@ -249,6 +228,36 @@ func routeMoEBatch(ctx context.Context, data []byte, x []float32, s *moeBatchScr
 	var dummy simd.Float32s
 	lanes := dummy.Len()
 	partials := make([]float32, lanes)
+	if s.batch == 1 {
+		for expert := 0; expert < s.experts; expert++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			row := data[expert*s.hidden*4 : (expert+1)*s.hidden*4]
+			var sumVector simd.Float32s
+			for offset := 0; offset < s.hidden; offset += lanes {
+				end := min(offset+lanes, s.hidden)
+				for i := offset; i < end; i++ {
+					partials[i-offset] = math.Float32frombits(binary.LittleEndian.Uint32(row[i*4:]))
+				}
+				var w, v simd.Float32s
+				if end-offset == lanes {
+					w, v = simd.LoadFloat32s(partials), simd.LoadFloat32s(x[offset:end])
+				} else {
+					w, _ = simd.LoadFloat32sPart(partials[:end-offset])
+					v, _ = simd.LoadFloat32sPart(x[offset:end])
+				}
+				sumVector = w.MulAdd(v, sumVector)
+			}
+			sumVector.Store(partials)
+			var sum float32
+			for _, p := range partials {
+				sum += p
+			}
+			s.logits[expert] = sum + s.routerBias[expert]
+		}
+		return ctx.Err()
+	}
 	acc := make([]float32, moeBatchTile*lanes)
 	for expert := 0; expert < s.experts; expert++ {
 		row := data[expert*s.hidden*4 : (expert+1)*s.hidden*4]
@@ -333,33 +342,4 @@ func selectMoEBatch(logits []float32, selected []ExpertSelection) {
 			selected[i].Weight *= inv
 		}
 	}
-}
-
-func evaluateMoEBatchExpert(ctx context.Context, gate, up, down []byte, x []float32,
-	head int, s *moeBatchScratch, options Q40Options,
-) error {
-	var inputs, activations, outputs [moeBatchTile]int
-	for head >= 0 {
-		count := 0
-		for head >= 0 && count < moeBatchTile {
-			inputs[count] = head / s.topK * s.hidden
-			activations[count] = count * s.expertDim
-			outputs[count] = head * s.hidden
-			head = s.next[head]
-			count++
-		}
-		if err := mulMoEBatchExpert(ctx, gate, s.hidden, s.expertDim, x, inputs[:count], s.gateBias, s.gate, activations[:count], options); err != nil {
-			return err
-		}
-		if err := mulMoEBatchExpert(ctx, up, s.hidden, s.expertDim, x, inputs[:count], s.upBias, s.up, activations[:count], options); err != nil {
-			return err
-		}
-		for i := 0; i < count*s.expertDim; i++ {
-			s.act[i] = gptOSSSwiGLU(s.gate[i], s.up[i])
-		}
-		if err := mulMoEBatchExpert(ctx, down, s.expertDim, s.hidden, s.act, activations[:count], s.downBias, s.results, outputs[:count], options); err != nil {
-			return err
-		}
-	}
-	return ctx.Err()
 }

@@ -173,9 +173,7 @@ func ForwardLayer(
 	if cfg.NumExpertsUsed <= 0 || cfg.NumExpertsUsed > cfg.NumExperts {
 		return fmt.Errorf("layer %d MoE: invalid expert count %d or top-k %d", layerIdx, cfg.NumExperts, cfg.NumExpertsUsed)
 	}
-	if scratch.moe == nil || len(scratch.moe.gateOut) != cfg.ExpertHiddenDim ||
-		len(scratch.moe.downOut) != cfg.HiddenDim || len(scratch.moe.routerLogits) != cfg.NumExperts ||
-		len(scratch.moe.selected) != cfg.NumExpertsUsed {
+	if scratch.moe == nil {
 		scratch.moe = newMoEScratch(cfg)
 	}
 	if err := forwardMoE(ctx, reader, scratch.NormedX, cfg,
