@@ -15,6 +15,10 @@ const DefaultPrefillBatchSize = 32
 // Like ForwardToken, it is not safe to call concurrently on the same engine.
 // Cache and activation buffers may be partially updated on error or cancellation.
 func (e *Engine) Prefill(ctx context.Context, tokens []int, startPos int) (int, error) {
+	return e.prefill(ctx, tokens, startPos, nil)
+}
+
+func (e *Engine) prefill(ctx context.Context, tokens []int, startPos int, sampler *tokenSampler) (int, error) {
 	if len(tokens) == 0 {
 		return 0, fmt.Errorf("empty prompt tokens")
 	}
@@ -46,7 +50,7 @@ func (e *Engine) Prefill(ctx context.Context, tokens []int, startPos int) (int, 
 		var next int
 		for index, token := range tokens {
 			var err error
-			next, err = e.forwardToken(ctx, token, startPos+index, index == len(tokens)-1)
+			next, err = e.forwardToken(ctx, token, startPos+index, index == len(tokens)-1, sampler)
 			if err != nil {
 				return stepError(index, err)
 			}
@@ -79,7 +83,7 @@ func (e *Engine) Prefill(ctx context.Context, tokens []int, startPos int) (int, 
 		}
 		copy(e.X, x[(batch-1)*dim:batch*dim])
 	}
-	next, err := e.projectOutput(ctx, options)
+	next, err := e.projectSampledOutput(ctx, options, sampler)
 	if err != nil {
 		return stepError(len(tokens)-1, err)
 	}

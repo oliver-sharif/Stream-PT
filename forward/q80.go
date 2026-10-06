@@ -95,6 +95,45 @@ func MulQ80Argmax(
 	return bestToken, bestLogit, err
 }
 
+// MulQ80Into streams the output weights but retains all logits for sampling.
+func MulQ80Into(ctx context.Context, reader *ggufmmap.Reader, tensor ggufindex.Tensor, x, y []float32, options Q40Options) error {
+	if ctx == nil || reader == nil {
+		return fmt.Errorf("nil context or reader")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	input, output, rowBytes, err := q80Shape(tensor)
+	if err != nil {
+		return err
+	}
+	if len(x) != input || len(y) != output {
+		return fmt.Errorf("%q: expected input/output lengths %d/%d, got %d/%d", tensor.Name, input, output, len(x), len(y))
+	}
+	window := options.WindowBytes
+	if window == 0 {
+		window = DefaultQ40WindowBytes
+	}
+	if window < uint64(rowBytes) {
+		return fmt.Errorf("window of %d bytes cannot accommodate a %d-byte row", window, rowBytes)
+	}
+	rowsPerWindow := int(min(window/uint64(rowBytes), uint64(output)))
+	workers := min(max(options.Workers, 1), runtime.GOMAXPROCS(0), rowsPerWindow)
+	pool := newQuantWorkers(workers, func(_ int, job quantRowJob) {
+		for row := job.begin; row < job.end; row++ {
+			if ctx.Err() != nil {
+				break
+			}
+			y[job.firstRow+row] = dotQ80(job.data[row*rowBytes:(row+1)*rowBytes], x)
+		}
+	})
+	defer pool.close()
+	return reader.WithTensorChunks(tensor, uint64(rowsPerWindow)*uint64(rowBytes), func(offset uint64, data []byte) error {
+		pool.run(data, int(offset/uint64(rowBytes)), len(data)/rowBytes)
+		return ctx.Err()
+	})
+}
+
 func q80Shape(tensor ggufindex.Tensor) (input, output, rowBytes int, err error) {
 	if tensor.Type != 8 {
 		return 0, 0, 0, fmt.Errorf("%q: GGML type %d instead of Q8_0 (8)", tensor.Name, tensor.Type)

@@ -126,7 +126,11 @@ func TestPrefillSkipsIntermediateOutputProjection(t *testing.T) {
 				return true
 			})
 			// Invalid output tensors expose any premature norm/head call without timing assertions.
-			if err == nil || !strings.Contains(err.Error(), "prefill step 2 (token 2): "+stage) {
+			generationStage := stage
+			if stage == "output argmax" {
+				generationStage = "output logits"
+			}
+			if err == nil || !strings.Contains(err.Error(), "prefill step 2 (token 2): "+generationStage) {
 				t.Fatalf("Generate error = %v, want output failure only at the last prompt token", err)
 			}
 			if got != nil || calls != 0 {
@@ -195,6 +199,9 @@ func TestPrefillMatchesFullProjection(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			engine, baseline := prefillEngineFixture(t), prefillEngineFixture(t)
+			greedy := DefaultSamplingOptions()
+			greedy.Temperature, greedy.RepeatPenalty = 0, 1
+			engine.Options.Sampling = &greedy
 			if tc.eos {
 				probe := prefillEngineFixture(t)
 				var next int

@@ -26,7 +26,7 @@ func TestEncodeChatPrompt(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := []int{5, 0, 6, 3, 4, 7, 5, 1, 8, 2, 6}
+			want := []int{5, 0, 6, 3, 4, 7, 5, 1}
 			if !slices.Equal(got, want) {
 				t.Fatalf("chat prompt = %v, want %v", got, want)
 			}
@@ -43,7 +43,7 @@ func TestEncodeChatPromptMissingSpecialTokens(t *testing.T) {
 }
 
 func TestEncodeChatMessages(t *testing.T) {
-	special := []string{"<|start|>", "<|message|>", "<|end|>", "<|channel|>"}
+	special := []string{"<|start|>", "<|message|>", "<|end|>", "<|channel|>", "<|return|>"}
 	tok := tokenizerFixture(t, append([]string{"user", "assistant", "final", "system", "Hi", "Hello", "!"}, special...))
 
 	messages := []ChatMessage{
@@ -57,20 +57,20 @@ func TestEncodeChatMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify that each message begins with start, role, (channel/final if assistant), message, content tokens, end
-	// And terminates with start, assistant, channel, final, message
-	if len(got) == 0 {
-		t.Fatal("expected non-empty tokens")
+	want := []int{7, 3, 8, 5, 9, 7, 0, 8, 4, 9,
+		7, 1, 10, 2, 8, 5, 6, 11, 7, 0, 8, 4, 6, 9, 7, 1}
+	if !slices.Equal(got, want) {
+		t.Fatalf("chat = %v, want %v (completed assistant turn and open generation header)", got, want)
 	}
-	// Verify last 5 tokens are start, assistant, channel, final, message
-	startID := tok.TokenMap["<|start|>"]
-	asstID := tok.TokenMap["assistant"]
-	chanID := tok.TokenMap["<|channel|>"]
-	finalID := tok.TokenMap["final"]
-	msgID := tok.TokenMap["<|message|>"]
-	wantTail := []int{startID, asstID, chanID, finalID, msgID}
-	if !slices.Equal(got[len(got)-5:], wantTail) {
-		t.Fatalf("tail = %v, want %v", got[len(got)-5:], wantTail)
+}
+
+func TestHarmonyMessageEndIsNotGenerationEnd(t *testing.T) {
+	e := &Engine{Config: &Config{EOS: 99, EOSTokens: []int{0, 1}},
+		Tokenizer: &Tokenizer{Tokens: []string{"<|end|>", "<|im_end|>"}}}
+	for id := range e.Tokenizer.Tokens {
+		if e.IsEOS(id) {
+			t.Fatalf("%q must allow analysis to continue into final", e.Tokenizer.Tokens[id])
+		}
 	}
 }
 

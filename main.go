@@ -24,13 +24,14 @@ import (
 )
 
 type ServerInfo struct {
-	ModelName        string `json:"model_name"`
-	LayerCount       int    `json:"layer_count"`
-	Workers          int    `json:"workers"`
-	WindowMB         int    `json:"window_mb"`
-	DefaultMaxTokens int    `json:"default_max_tokens"`
-	CPU              string `json:"cpu"`
-	RAM              string `json:"ram"`
+	ModelName        string                  `json:"model_name"`
+	LayerCount       int                     `json:"layer_count"`
+	Workers          int                     `json:"workers"`
+	WindowMB         int                     `json:"window_mb"`
+	DefaultMaxTokens int                     `json:"default_max_tokens"`
+	DefaultSampling  forward.SamplingOptions `json:"default_sampling"`
+	CPU              string                  `json:"cpu"`
+	RAM              string                  `json:"ram"`
 }
 
 type ChatServer struct {
@@ -41,10 +42,57 @@ type ChatServer struct {
 }
 
 type ChatRequest struct {
-	Messages     []forward.ChatMessage `json:"messages"`
-	Prompt       string                `json:"prompt"`
-	SystemPrompt string                `json:"system_prompt,omitempty"`
-	MaxTokens    int                   `json:"max_tokens"`
+	Messages         []forward.ChatMessage `json:"messages"`
+	Prompt           string                `json:"prompt"`
+	SystemPrompt     string                `json:"system_prompt,omitempty"`
+	MaxTokens        int                   `json:"max_tokens"`
+	Temperature      *float64              `json:"temperature"`
+	TopK             *int                  `json:"top_k"`
+	TopP             *float64              `json:"top_p"`
+	MinP             *float64              `json:"min_p"`
+	RepeatPenalty    *float64              `json:"repeat_penalty"`
+	RepeatLastN      *int                  `json:"repeat_last_n"`
+	FrequencyPenalty *float64              `json:"frequency_penalty"`
+	PresencePenalty  *float64              `json:"presence_penalty"`
+	Seed             *uint64               `json:"seed"`
+}
+
+func (s *ChatServer) samplingDefaults() forward.SamplingOptions {
+	if s.Engine != nil && s.Engine.Options.Sampling != nil {
+		return *s.Engine.Options.Sampling
+	}
+	return forward.DefaultSamplingOptions()
+}
+
+func (r ChatRequest) samplingOptions(options forward.SamplingOptions) forward.SamplingOptions {
+	if r.Temperature != nil {
+		options.Temperature = *r.Temperature
+	}
+	if r.TopK != nil {
+		options.TopK = *r.TopK
+	}
+	if r.TopP != nil {
+		options.TopP = *r.TopP
+	}
+	if r.MinP != nil {
+		options.MinP = *r.MinP
+	}
+	if r.RepeatPenalty != nil {
+		options.RepeatPenalty = *r.RepeatPenalty
+	}
+	if r.RepeatLastN != nil {
+		options.RepeatLastN = *r.RepeatLastN
+	}
+	if r.FrequencyPenalty != nil {
+		options.FrequencyPenalty = *r.FrequencyPenalty
+	}
+	if r.PresencePenalty != nil {
+		options.PresencePenalty = *r.PresencePenalty
+	}
+	if r.Seed != nil {
+		options.Seed = r.Seed
+	}
+	return options
 }
 
 type ChatEvent struct {
@@ -77,6 +125,7 @@ func (s *ChatServer) handleInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	info := s.ModelInfo
+	info.DefaultSampling = s.samplingDefaults()
 	if info.DefaultMaxTokens == 0 {
 		info.DefaultMaxTokens = s.DefaultMaxTokens
 	}
@@ -113,6 +162,11 @@ func (s *ChatServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid JSON request: %v", err), http.StatusBadRequest)
+		return
+	}
+	sampling := req.samplingOptions(s.samplingDefaults())
+	if err := sampling.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -172,7 +226,7 @@ func (s *ChatServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	_, err = s.Engine.Generate(ctx, promptTokens, maxTokens, func(tokenID int, text string) bool {
+	_, err = s.Engine.GenerateWithSampling(ctx, promptTokens, maxTokens, sampling, func(tokenID int, text string) bool {
 		if ctx.Err() != nil {
 			return false
 		}
@@ -676,6 +730,26 @@ const indexHTML = `<!DOCTYPE html>
 
         <div class="setting-group">
           <div class="setting-header">
+            <label for="temperature-input">Temperature</label>
+            <span class="setting-value" id="temperature-display">0.80</span>
+          </div>
+          <div class="slider-row">
+            <input type="range" id="temperature-slider" min="0" max="2" step="0.01" value="0.8">
+            <input type="number" id="temperature-input" min="0" max="2" step="0.01" value="0.8">
+          </div>
+          <p class="setting-help">0 = deterministische Auswahl mit Wiederholungsstrafe. Höhere Werte erzeugen vielfältigere Antworten; Standard: 0,8.</p>
+        </div>
+
+        <div class="setting-group">
+          <div class="setting-header">
+            <label for="repeat-penalty-input">Wiederholungsstrafe</label>
+            <input type="number" id="repeat-penalty-input" min="1" max="2" step="0.01" value="1">
+          </div>
+          <p class="setting-help">Standard: 1 (deaktiviert, wie llama.cpp). Höhere Werte bestrafen die letzten 64 Kontext- und Antwort-Tokens und können Code und Formatierung beschädigen. Sampling: Top-k 40, Top-p 0,95, Min-p 0,05 (Server-Standardwerte).</p>
+        </div>
+
+        <div class="setting-group">
+          <div class="setting-header">
             <label for="system-prompt-input">System-Prompt (Rolle / Anweisung)</label>
           </div>
           <textarea id="system-prompt-input" class="form-textarea" rows="2" placeholder="z. B. Du bist ein präziser, deutschsprachiger KI-Assistent..."></textarea>
@@ -724,11 +798,18 @@ const indexHTML = `<!DOCTYPE html>
     const maxTokensInput = document.getElementById('max-tokens-input');
     const maxTokensDisplay = document.getElementById('max-tokens-display');
     const systemPromptInput = document.getElementById('system-prompt-input');
+    const temperatureSlider = document.getElementById('temperature-slider');
+    const temperatureInput = document.getElementById('temperature-input');
+    const temperatureDisplay = document.getElementById('temperature-display');
+    const repeatPenaltyInput = document.getElementById('repeat-penalty-input');
     const presetButtons = document.querySelectorAll('.preset-btn');
 
-    let serverDefaults = { default_max_tokens: 512 };
+    let serverDefaults = { default_max_tokens: 512, default_sampling: { temperature: 0.8, repeat_penalty: 1 } };
     let settings = {
+      version: 2,
       maxTokens: 512,
+      temperature: 0.8,
+      repeatPenalty: 1,
       systemPrompt: ''
     };
 
@@ -736,16 +817,35 @@ const indexHTML = `<!DOCTYPE html>
     let isGenerating = false;
     let abortController = null;
 
+    function readSavedSettings() {
+      try {
+        const parsed = JSON.parse(localStorage.getItem('stream_pt_settings') || '{}') || {};
+        if (parsed.version !== 2) {
+          // Replace only the old implicit defaults, preserving custom values.
+          if (parsed.maxTokens === 5) delete parsed.maxTokens;
+          if (parsed.repeatPenalty === 1.1) delete parsed.repeatPenalty;
+        }
+        return parsed;
+      } catch (e) {
+        return {};
+      }
+    }
+
     function loadSettings() {
       try {
-        const saved = localStorage.getItem('stream_pt_settings');
-        if (saved) {
-          const parsed = JSON.parse(saved);
+        const parsed = readSavedSettings();
+        if (parsed) {
           if (parsed.maxTokens && Number.isInteger(parsed.maxTokens) && parsed.maxTokens > 0) {
             settings.maxTokens = parsed.maxTokens;
           }
           if (typeof parsed.systemPrompt === 'string') {
             settings.systemPrompt = parsed.systemPrompt;
+          }
+          if (Number.isFinite(parsed.temperature) && parsed.temperature >= 0) {
+            settings.temperature = parsed.temperature;
+          }
+          if (Number.isFinite(parsed.repeatPenalty) && parsed.repeatPenalty > 0) {
+            settings.repeatPenalty = parsed.repeatPenalty;
           }
         }
       } catch (e) {
@@ -769,6 +869,10 @@ const indexHTML = `<!DOCTYPE html>
       maxTokensDisplay.textContent = settings.maxTokens;
       footerMaxTokens.textContent = settings.maxTokens;
       systemPromptInput.value = settings.systemPrompt || '';
+      temperatureSlider.value = settings.temperature;
+      temperatureInput.value = settings.temperature;
+      temperatureDisplay.textContent = settings.temperature.toFixed(2);
+      repeatPenaltyInput.value = settings.repeatPenalty;
 
       presetButtons.forEach(btn => {
         if (parseInt(btn.dataset.val, 10) === settings.maxTokens) {
@@ -789,6 +893,20 @@ const indexHTML = `<!DOCTYPE html>
 
     maxTokensSlider.addEventListener('input', (e) => setMaxTokens(e.target.value));
     maxTokensInput.addEventListener('change', (e) => setMaxTokens(e.target.value));
+    function setTemperature(val) {
+      const num = Number(val);
+      if (!Number.isFinite(num)) return;
+      settings.temperature = Math.max(0, Math.min(2, num));
+      saveSettings();
+    }
+    temperatureSlider.addEventListener('input', (e) => setTemperature(e.target.value));
+    temperatureInput.addEventListener('change', (e) => setTemperature(e.target.value));
+    repeatPenaltyInput.addEventListener('change', (e) => {
+      const num = Number(e.target.value);
+      if (!Number.isFinite(num)) return;
+      settings.repeatPenalty = Math.max(1, Math.min(2, num));
+      saveSettings();
+    });
     systemPromptInput.addEventListener('input', (e) => {
       settings.systemPrompt = e.target.value;
       saveSettings();
@@ -818,6 +936,8 @@ const indexHTML = `<!DOCTYPE html>
 
     resetSettingsBtn.addEventListener('click', () => {
       settings.maxTokens = serverDefaults.default_max_tokens || 512;
+      settings.temperature = serverDefaults.default_sampling?.temperature ?? 0.8;
+      settings.repeatPenalty = serverDefaults.default_sampling?.repeat_penalty ?? 1;
       settings.systemPrompt = '';
       saveSettings();
     });
@@ -828,10 +948,17 @@ const indexHTML = `<!DOCTYPE html>
         if (res.ok) {
           const info = await res.json();
           serverDefaults = info;
-          if (info.default_max_tokens && !localStorage.getItem('stream_pt_settings')) {
-            settings.maxTokens = info.default_max_tokens;
-            applySettingsToUI();
+          const saved = readSavedSettings();
+          if (!Number.isFinite(saved.temperature) || saved.temperature < 0) {
+            settings.temperature = info.default_sampling?.temperature ?? 0.8;
           }
+          if (!Number.isFinite(saved.repeatPenalty) || saved.repeatPenalty <= 0) {
+            settings.repeatPenalty = info.default_sampling?.repeat_penalty ?? 1;
+          }
+          if (info.default_max_tokens && !(Number.isInteger(saved.maxTokens) && saved.maxTokens > 0)) {
+            settings.maxTokens = info.default_max_tokens;
+          }
+          applySettingsToUI();
           if (info.model_name) document.getElementById('info-model').textContent = info.model_name;
           if (info.layer_count) document.getElementById('info-layers').textContent = info.layer_count;
           if (info.workers) document.getElementById('info-workers').textContent = info.workers;
@@ -942,6 +1069,8 @@ const indexHTML = `<!DOCTYPE html>
           body: JSON.stringify({
             messages: outgoingMessages,
             max_tokens: settings.maxTokens,
+            temperature: settings.temperature,
+            repeat_penalty: settings.repeatPenalty,
             system_prompt: settings.systemPrompt
           }),
           signal: abortController.signal
@@ -1026,14 +1155,24 @@ const indexHTML = `<!DOCTYPE html>
 `
 
 func main() {
+	sampling := forward.DefaultSamplingOptions()
+	flag.Float64Var(&sampling.Temperature, "temp", sampling.Temperature, "Sampling temperature (0 selects greedy decoding with penalties)")
+	flag.IntVar(&sampling.TopK, "top-k", sampling.TopK, "Top-k candidate limit (0 disables)")
+	flag.Float64Var(&sampling.TopP, "top-p", sampling.TopP, "Nucleus probability threshold (1 disables)")
+	flag.Float64Var(&sampling.MinP, "min-p", sampling.MinP, "Minimum probability relative to the best token (0 disables)")
+	flag.Float64Var(&sampling.RepeatPenalty, "repeat-penalty", sampling.RepeatPenalty, "Repetition penalty (1 disables)")
+	flag.IntVar(&sampling.RepeatLastN, "repeat-last-n", sampling.RepeatLastN, "Penalty history length (0 disables, -1 uses all context)")
+	flag.Float64Var(&sampling.FrequencyPenalty, "frequency-penalty", 0, "Penalty per previous token occurrence")
+	flag.Float64Var(&sampling.PresencePenalty, "presence-penalty", 0, "Penalty for previously seen tokens")
+	seedFlag := flag.String("seed", "", "Sampling seed (empty selects a random seed)")
 	threadsFlag := flag.Int("threads", runtime.GOMAXPROCS(0), "Number of parallel worker goroutines / compute threads")
 	flag.IntVar(threadsFlag, "t", runtime.GOMAXPROCS(0), "Number of parallel worker goroutines (shorthand)")
 
 	windowMBFlag := flag.Int("window-mb", 64, "Streaming mmap chunk window size in MiB")
 	flag.IntVar(windowMBFlag, "w", 64, "Streaming mmap chunk window size in MiB (shorthand)")
 
-	maxTokensFlag := flag.Int("max-tokens", 5, "Maximum number of tokens to generate")
-	flag.IntVar(maxTokensFlag, "n", 5, "Maximum number of tokens to generate (shorthand)")
+	maxTokensFlag := flag.Int("max-tokens", 512, "Maximum number of tokens to generate")
+	flag.IntVar(maxTokensFlag, "n", 512, "Maximum number of tokens to generate (shorthand)")
 
 	promptFlag := flag.String("prompt", "", "Prompt / input text for generation (if set, runs CLI generation instead of web server)")
 	flag.StringVar(promptFlag, "p", "", "Prompt / input text for generation (shorthand)")
@@ -1047,6 +1186,16 @@ func main() {
 	noExpertLookaheadFlag := flag.Bool("no-expert-lookahead", false, "Disable prefetch of the next selected expert run (for comparison)")
 
 	flag.Parse()
+	if *seedFlag != "" {
+		seed, err := strconv.ParseUint(*seedFlag, 10, 64)
+		if err != nil {
+			log.Fatalf("Invalid seed: %v", err)
+		}
+		sampling.Seed = &seed
+	}
+	if err := sampling.Validate(); err != nil {
+		log.Fatal(err)
+	}
 	if *expertCacheMBFlag > ^uint64(0)>>20 {
 		log.Fatal("expert-cache-mb exceeds supported size")
 	}
@@ -1105,6 +1254,7 @@ func main() {
 	engineOpts := forward.EngineOptions{
 		Workers:     threads,
 		WindowBytes: windowBytes,
+		Sampling:    &sampling,
 	}
 
 	engine, err := forward.NewEngineWithOptions(model, reader, engineOpts)

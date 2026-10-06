@@ -39,6 +39,12 @@ func TestCLIThreadDefaults(t *testing.T) {
 			t.Fatalf("%s must preserve GOMAXPROCS=8:\n%s", flag, output)
 		}
 	}
+	for _, flag := range []string{"-max-tokens int", "-n int"} {
+		_, description, ok := strings.Cut(string(output), flag+"\n")
+		if !ok || !strings.Contains(strings.SplitN(description, "\n", 2)[0], "(default 512)") {
+			t.Fatalf("%s must allow complete answers by default:\n%s", flag, output)
+		}
+	}
 }
 
 func TestChatServerIndex(t *testing.T) {
@@ -66,7 +72,7 @@ func TestChatServerIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := buf.String()
-	for _, expected := range []string{"Stream-PT", "/api/chat", "/api/info", "max-tokens-slider", "system-prompt-input", "settings-modal"} {
+	for _, expected := range []string{"Stream-PT", "/api/chat", "/api/info", "max-tokens-slider", "system-prompt-input", "settings-modal", "temperature-slider", "temperature-input", "repeat-penalty-input", "temperature: settings.temperature", "repeat_penalty: settings.repeatPenalty"} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("Index HTML missing %q", expected)
 		}
@@ -105,6 +111,9 @@ func TestChatServerInfo(t *testing.T) {
 		if info.ModelName != "gpt-oss-test" || info.DefaultMaxTokens != 128 || info.Workers != 4 {
 			t.Fatalf("unexpected info response: %+v", info)
 		}
+		if info.DefaultSampling.Temperature != 0.8 || info.DefaultSampling.RepeatPenalty != 1 {
+			t.Fatalf("unexpected sampling defaults: %+v", info.DefaultSampling)
+		}
 	})
 
 	t.Run("MethodNotAllowed", func(t *testing.T) {
@@ -122,6 +131,23 @@ func TestChatServerInfo(t *testing.T) {
 func TestChatServerValidation(t *testing.T) {
 	srv := &ChatServer{DefaultMaxTokens: 10}
 	handler := srv.routes()
+	for _, field := range []string{`"top_k":-1`, `"top_p":0`, `"top_p":1.1`, `"min_p":-1`, `"repeat_penalty":0`, `"repeat_last_n":-2`, `"seed":-1`, `"temperature":"hot"`} {
+		req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"prompt":"Ja",`+field+`}`))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status %d", field, rec.Code)
+		}
+	}
+
+	t.Run("InvalidTemperature", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"prompt":"Ja","temperature":-1}`))
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+		}
+	})
 
 	t.Run("MethodNotAllowed", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodGet, "/api/chat", nil)
@@ -211,6 +237,34 @@ func TestChatServerSSEStreaming(t *testing.T) {
 	srv := &ChatServer{Engine: engine, DefaultMaxTokens: 5}
 	ts := httptest.NewServer(srv.routes())
 	defer ts.Close()
+
+	t.Run("SamplingRequestPropagation", func(t *testing.T) {
+		for _, tc := range []struct {
+			fields string
+			want   int
+		}{
+			{`"temperature":0,"repeat_penalty":1`, 1},
+			{`"temperature":0,"frequency_penalty":100`, 0},
+			{`"temperature":0,"repeat_penalty":1`, 1}, // Request history and overrides must not leak.
+		} {
+			req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"messages":[{"role":"user","content":"Ja"}],"max_tokens":1,`+tc.fields+`}`))
+			rec := httptest.NewRecorder()
+			srv.routes().ServeHTTP(rec, req)
+			var events []ChatEvent
+			for _, line := range strings.Split(rec.Body.String(), "\n") {
+				if strings.HasPrefix(line, "data: ") {
+					var event ChatEvent
+					if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+						t.Fatal(err)
+					}
+					events = append(events, event)
+				}
+			}
+			if len(events) != 2 || events[0].Token != tc.want || events[0].Error != "" || !events[1].Done {
+				t.Fatalf("%s: events %+v, want token %d and done", tc.fields, events, tc.want)
+			}
+		}
+	})
 
 	t.Run("DefaultStreaming", func(t *testing.T) {
 		reqBody := `{"messages":[{"role":"user","content":"Ja"}]}`
@@ -303,4 +357,33 @@ func TestChatServerSSEStreaming(t *testing.T) {
 			t.Fatalf("expected at most 2 token events for max_tokens:2, got %d", tokenEvents)
 		}
 	})
+}
+
+func TestChatSamplingOverrides(t *testing.T) {
+	defaults := forward.DefaultSamplingOptions()
+	defaults.Temperature = 1.2
+	for _, tc := range []struct {
+		body        string
+		temperature float64
+		lastN       int
+	}{
+		{`{}`, 1.2, 64},
+		{`{"temperature":0,"repeat_last_n":0,"top_k":0,"min_p":0}`, 0, 0},
+		{`{"temperature":null,"seed":0}`, 1.2, 64},
+	} {
+		var req ChatRequest
+		if err := json.Unmarshal([]byte(tc.body), &req); err != nil {
+			t.Fatal(err)
+		}
+		options := req.samplingOptions(defaults)
+		if options.Temperature != tc.temperature || options.RepeatLastN != tc.lastN {
+			t.Fatalf("overrides %+v", options)
+		}
+		if err := options.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if defaults.Temperature != 1.2 || defaults.RepeatLastN != 64 {
+		t.Fatal("defaults mutated")
+	}
 }

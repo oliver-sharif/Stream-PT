@@ -18,9 +18,10 @@ import (
 
 // EngineOptions configures runtime concurrency and streaming memory limits.
 type EngineOptions struct {
-	Workers          int    // Number of worker goroutines for matrix multiplications (default: runtime.GOMAXPROCS(0))
-	WindowBytes      uint64 // Chunk window size in bytes for streaming mmap (default: 8 MiB)
-	PrefillBatchSize int    // Prompt positions per weight pass (default: 32; one uses the decode path).
+	Workers          int              // Number of worker goroutines for matrix multiplications (default: runtime.GOMAXPROCS(0))
+	WindowBytes      uint64           // Chunk window size in bytes for streaming mmap (default: 8 MiB)
+	PrefillBatchSize int              // Prompt positions per weight pass (default: 32; one uses the decode path).
+	Sampling         *SamplingOptions // Nil uses DefaultSamplingOptions for Generate.
 }
 
 // Engine manages the end-to-end streaming inference pipeline.
@@ -57,6 +58,11 @@ func NewEngineWithOptions(model *ggufindex.Model, reader *ggufmmap.Reader, optio
 	}
 	if options.PrefillBatchSize < 0 {
 		return nil, fmt.Errorf("invalid prefill batch size %d", options.PrefillBatchSize)
+	}
+	if options.Sampling != nil {
+		if err := options.Sampling.Validate(); err != nil {
+			return nil, err
+		}
 	}
 
 	cfg, err := NewConfigFromModel(model)
@@ -137,13 +143,13 @@ func NewEngineWithOptions(model *ggufindex.Model, reader *ggufmmap.Reader, optio
 }
 
 // ForwardToken processes a single token at position pos through all transformer layers
-// and returns the sampled / argmax next token ID.
+// and returns the greedy next token ID. Generate uses configurable sampling.
 func (e *Engine) ForwardToken(ctx context.Context, tokenID, pos int) (int, error) {
-	return e.forwardToken(ctx, tokenID, pos, true)
+	return e.forwardToken(ctx, tokenID, pos, true, nil)
 }
 
 // forwardToken advances the layer state and KV cache, optionally projecting the next token.
-func (e *Engine) forwardToken(ctx context.Context, tokenID, pos int, projectOutput bool) (int, error) {
+func (e *Engine) forwardToken(ctx context.Context, tokenID, pos int, projectOutput bool, sampler *tokenSampler) (int, error) {
 	if ctx == nil {
 		return 0, fmt.Errorf("nil context")
 	}
@@ -173,16 +179,33 @@ func (e *Engine) forwardToken(ctx context.Context, tokenID, pos int, projectOutp
 	if !projectOutput {
 		return 0, nil
 	}
-	return e.projectOutput(ctx, opts)
+	return e.projectSampledOutput(ctx, opts, sampler)
 }
 
 func (e *Engine) projectOutput(ctx context.Context, opts Q40Options) (int, error) {
+	return e.projectSampledOutput(ctx, opts, nil)
+}
+
+func (e *Engine) projectSampledOutput(ctx context.Context, opts Q40Options, sampler *tokenSampler) (int, error) {
 	// 3. Final layer norm.
 	if err := RMSNormInto(ctx, e.Reader, e.OutputNorm, e.X, e.Scratch.NormedX, e.Config.RMSNormEps); err != nil {
 		return 0, fmt.Errorf("final norm: %w", err)
 	}
 
-	// 4. LM head projection & Argmax.
+	// 4. LM head projection and token selection.
+	if sampler != nil {
+		_, vocab, _, err := q80Shape(e.OutputWeight)
+		if err != nil {
+			return 0, fmt.Errorf("output logits: %w", err)
+		}
+		if len(sampler.logits) != vocab {
+			sampler.logits = make([]float32, vocab)
+		}
+		if err := MulQ80Into(ctx, e.Reader, e.OutputWeight, e.Scratch.NormedX, sampler.logits, opts); err != nil {
+			return 0, fmt.Errorf("output logits: %w", err)
+		}
+		return sampler.sample(sampler.logits)
+	}
 	bestToken, _, err := MulQ80Argmax(ctx, e.Reader, e.OutputWeight, e.Scratch.NormedX, opts)
 	if err != nil {
 		return 0, fmt.Errorf("output argmax: %w", err)
@@ -215,18 +238,30 @@ func (e *Engine) Generate(
 	maxNewTokens int,
 	onToken func(tokenID int, text string) bool,
 ) ([]int, error) {
+	options := DefaultSamplingOptions()
+	if e.Options.Sampling != nil {
+		options = *e.Options.Sampling
+	}
+	return e.GenerateWithSampling(ctx, promptTokens, maxNewTokens, options, onToken)
+}
+
+// GenerateWithSampling uses request-local sampling state without changing engine options.
+func (e *Engine) GenerateWithSampling(ctx context.Context, promptTokens []int, maxNewTokens int, options SamplingOptions, onToken func(int, string) bool) ([]int, error) {
 	if len(promptTokens) == 0 {
 		return nil, fmt.Errorf("empty prompt tokens")
 	}
 	if maxNewTokens <= 0 {
 		maxNewTokens = 64
 	}
+	sampler, err := newTokenSampler(options, promptTokens)
+	if err != nil {
+		return nil, err
+	}
 
 	var generated []int
 	var nextToken int
-	var err error
 
-	nextToken, err = e.Prefill(ctx, promptTokens, 0)
+	nextToken, err = e.prefill(ctx, promptTokens, 0, sampler)
 	if err != nil {
 		return nil, err
 	}
@@ -237,6 +272,7 @@ func (e *Engine) Generate(
 			break
 		}
 		generated = append(generated, nextToken)
+		sampler.accept(nextToken)
 		tokenText := ""
 		if e.Tokenizer != nil {
 			tokenText = e.Tokenizer.Decode([]int{nextToken})
@@ -249,7 +285,7 @@ func (e *Engine) Generate(
 		if i+1 == maxNewTokens {
 			break
 		}
-		nextToken, err = e.ForwardToken(ctx, nextToken, pos)
+		nextToken, err = e.forwardToken(ctx, nextToken, pos, true, sampler)
 		if err != nil {
 			return generated, fmt.Errorf("generation step %d (token %d): %w", i, nextToken, err)
 		}
@@ -267,6 +303,7 @@ type Tokenizer struct {
 	unicodeToByte map[rune]byte
 	maxTokenLen   int
 	encoder       tokenizerEncoder
+	bpe           *tokenizerBPE
 }
 
 func initByteToUnicode() ([256]rune, map[rune]byte) {
@@ -361,7 +398,12 @@ func LoadTokenizer(model *ggufindex.Model) (*Tokenizer, error) {
 		unicodeToByte: u2b,
 		maxTokenLen:   maxTokenLen,
 	}
-	tokenizer.initEncoder()
+	if err := tokenizer.loadBPE(model); err != nil {
+		return nil, err
+	}
+	if tokenizer.bpe == nil {
+		tokenizer.initEncoder()
+	}
 	return tokenizer, nil
 }
 
@@ -386,10 +428,13 @@ func (t *Tokenizer) Decode(tokens []int) string {
 	return string(rawBytes)
 }
 
-// Encode converts input text into token IDs using greedy longest-prefix matching on byte-level BPE tokens.
+// Encode uses GGUF merge ranks and pretokenization, or greedy matching when merges are absent.
 func (t *Tokenizer) Encode(text string) []int {
 	if t == nil || len(text) == 0 {
 		return nil
+	}
+	if t.bpe != nil {
+		return t.encodeBPE(text)
 	}
 	t.initEncoder()
 
