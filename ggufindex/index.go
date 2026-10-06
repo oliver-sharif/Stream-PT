@@ -9,7 +9,6 @@ import (
 	"regexp"
 	"sort"
 	"strconv"
-	"strings"
 )
 
 // Range represents [Start, End) as absolute byte offsets within a file.
@@ -590,10 +589,4 @@ func (m *Model) TensorByName(name string) (Tensor, bool) {
 		}
 	}
 	return Tensor{}, false
-}
-
-// IsLayerTensor reports whether a name matches the blk.<number>.* pattern.
-func IsLayerTensor(name string) bool {
-	return strings.HasPrefix(name, "blk.") &&
-		layerName.MatchString(name)
 }

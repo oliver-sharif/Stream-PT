@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -13,12 +13,11 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
 
-func moeBatchFixture(tb testing.TB, hidden, expertDim, experts, topK, biasType int, routerMode string) (*ggufmmap.Reader, *forward.Config, *forward.LayerWeights) {
+func moeBatchFixture(tb testing.TB, hidden, expertDim, experts, topK, biasType int, routerMode string) (*ggufmmap.Reader, *Config, *LayerWeights) {
 	tb.Helper()
 	path := filepath.Join(tb.TempDir(), "moe.bin")
 	data := make([]byte, 37)
@@ -51,7 +50,7 @@ func moeBatchFixture(tb testing.TB, hidden, expertDim, experts, topK, biasType i
 			binary.LittleEndian.PutUint32(router[(e*hidden+i)*4:], math.Float32bits(value))
 		}
 	}
-	lw := &forward.LayerWeights{FFNGateInp: appendTensor("router", 0, []uint64{uint64(hidden), uint64(experts)}, router)}
+	lw := &LayerWeights{FFNGateInp: appendTensor("router", 0, []uint64{uint64(hidden), uint64(experts)}, router)}
 	quantized := func(name string, input, output, salt int) ggufindex.Tensor {
 		encoded := make([]byte, input/32*17*output*experts)
 		for block := 0; block < len(encoded)/17; block++ {
@@ -108,15 +107,15 @@ func moeBatchFixture(tb testing.TB, hidden, expertDim, experts, topK, biasType i
 			tb.Error(err)
 		}
 	})
-	return reader, &forward.Config{HiddenDim: hidden, ExpertHiddenDim: expertDim, NumExperts: experts, NumExpertsUsed: topK}, lw
+	return reader, &Config{HiddenDim: hidden, ExpertHiddenDim: expertDim, NumExperts: experts, NumExpertsUsed: topK}, lw
 }
 
-func moeBatchSequential(ctx context.Context, reader *ggufmmap.Reader, x []float32, cfg *forward.Config, lw *forward.LayerWeights, out []float32, batch int, options forward.Q40Options) error {
+func moeBatchSequential(ctx context.Context, reader *ggufmmap.Reader, x []float32, cfg *Config, lw *LayerWeights, out []float32, batch int, options Q40Options) error {
 	for token := range batch {
-		if err := forward.ForwardMoE(ctx, reader, x[token*cfg.HiddenDim:(token+1)*cfg.HiddenDim], cfg,
+		if err := forwardMoE(ctx, reader, x[token*cfg.HiddenDim:(token+1)*cfg.HiddenDim], cfg,
 			lw.FFNGateInp, lw.FFNGateInpBias, lw.FFNGateExps, lw.FFNGateExpsBias,
 			lw.FFNUpExps, lw.FFNUpExpsBias, lw.FFNDownExps, lw.FFNDownExpsBias,
-			out[token*cfg.HiddenDim:(token+1)*cfg.HiddenDim], options); err != nil {
+			out[token*cfg.HiddenDim:(token+1)*cfg.HiddenDim], options, nil); err != nil {
 			return err
 		}
 	}
@@ -139,14 +138,14 @@ func TestForwardMoEBatchMatchesSequential(t *testing.T) {
 								}
 							}
 							original := append([]float32(nil), x...)
-							if err := moeBatchSequential(context.Background(), reader, x, cfg, lw, want, batch, forward.Q40Options{Workers: 1}); err != nil {
+							if err := moeBatchSequential(context.Background(), reader, x, cfg, lw, want, batch, Q40Options{Workers: 1}); err != nil {
 								t.Fatal(err)
 							}
 							for _, workers := range []int{0, 1, 3} {
 								for i := range got {
 									got[i] = 999
 								}
-								if err := forward.ForwardMoEBatch(context.Background(), reader, x, cfg, lw, got, batch, forward.Q40Options{Workers: workers}); err != nil {
+								if err := forwardMoEBatch(context.Background(), reader, x, cfg, lw, got, batch, Q40Options{Workers: workers}, nil); err != nil {
 									t.Fatal(err)
 								}
 								for i := range got {
@@ -174,26 +173,26 @@ func TestForwardMoEBatchValidation(t *testing.T) {
 	x, out := make([]float32, 64), make([]float32, 64)
 	for _, tc := range []struct {
 		name   string
-		change func(*forward.Config, *forward.LayerWeights)
+		change func(*Config, *LayerWeights)
 	}{
-		{"zero hidden", func(c *forward.Config, _ *forward.LayerWeights) { c.HiddenDim = 0 }},
-		{"negative expert dimension", func(c *forward.Config, _ *forward.LayerWeights) { c.ExpertHiddenDim = -1 }},
-		{"unaligned expert dimension", func(c *forward.Config, _ *forward.LayerWeights) { c.ExpertHiddenDim = 63 }},
-		{"invalid topk", func(c *forward.Config, _ *forward.LayerWeights) { c.NumExpertsUsed = 5 }},
-		{"overflow", func(c *forward.Config, _ *forward.LayerWeights) { c.HiddenDim = int(^uint(0) >> 1) }},
-		{"router type", func(_ *forward.Config, w *forward.LayerWeights) { w.FFNGateInp.Type = 1 }},
-		{"router shape", func(_ *forward.Config, w *forward.LayerWeights) { w.FFNGateInp.Shape = nil }},
-		{"router range", func(_ *forward.Config, w *forward.LayerWeights) { w.FFNGateInp.Range.End-- }},
-		{"expert type", func(_ *forward.Config, w *forward.LayerWeights) { w.FFNUpExps.Type = 0 }},
-		{"expert shape", func(_ *forward.Config, w *forward.LayerWeights) { w.FFNGateExps.Shape = []uint64{32, 64, 5} }},
-		{"expert range", func(_ *forward.Config, w *forward.LayerWeights) {
+		{"zero hidden", func(c *Config, _ *LayerWeights) { c.HiddenDim = 0 }},
+		{"negative expert dimension", func(c *Config, _ *LayerWeights) { c.ExpertHiddenDim = -1 }},
+		{"unaligned expert dimension", func(c *Config, _ *LayerWeights) { c.ExpertHiddenDim = 63 }},
+		{"invalid topk", func(c *Config, _ *LayerWeights) { c.NumExpertsUsed = 5 }},
+		{"overflow", func(c *Config, _ *LayerWeights) { c.HiddenDim = int(^uint(0) >> 1) }},
+		{"router type", func(_ *Config, w *LayerWeights) { w.FFNGateInp.Type = 1 }},
+		{"router shape", func(_ *Config, w *LayerWeights) { w.FFNGateInp.Shape = nil }},
+		{"router range", func(_ *Config, w *LayerWeights) { w.FFNGateInp.Range.End-- }},
+		{"expert type", func(_ *Config, w *LayerWeights) { w.FFNUpExps.Type = 0 }},
+		{"expert shape", func(_ *Config, w *LayerWeights) { w.FFNGateExps.Shape = []uint64{32, 64, 5} }},
+		{"expert range", func(_ *Config, w *LayerWeights) {
 			w.FFNDownExps.Range.End = w.FFNDownExps.Range.Start - 1
 		}},
-		{"expert range overflow", func(_ *forward.Config, w *forward.LayerWeights) { w.FFNGateExps.Range.Start = ^uint64(0) - 7 }},
-		{"bias type", func(_ *forward.Config, w *forward.LayerWeights) { w.FFNUpExpsBias.Type = 39 }},
-		{"bias shape", func(_ *forward.Config, w *forward.LayerWeights) { w.FFNGateExpsBias.Shape = nil }},
-		{"bias range", func(_ *forward.Config, w *forward.LayerWeights) { w.FFNGateInpBias.Range.End-- }},
-		{"file range", func(_ *forward.Config, w *forward.LayerWeights) {
+		{"expert range overflow", func(_ *Config, w *LayerWeights) { w.FFNGateExps.Range.Start = ^uint64(0) - 7 }},
+		{"bias type", func(_ *Config, w *LayerWeights) { w.FFNUpExpsBias.Type = 39 }},
+		{"bias shape", func(_ *Config, w *LayerWeights) { w.FFNGateExpsBias.Shape = nil }},
+		{"bias range", func(_ *Config, w *LayerWeights) { w.FFNGateInpBias.Range.End-- }},
+		{"file range", func(_ *Config, w *LayerWeights) {
 			w.FFNGateInp.Range.Start += 100000
 			w.FFNGateInp.Range.End += 100000
 		}},
@@ -201,25 +200,25 @@ func TestForwardMoEBatchValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c, w := *cfg, *lw
 			tc.change(&c, &w)
-			if err := forward.ForwardMoEBatch(ctx, reader, x, &c, &w, out, 2, forward.Q40Options{}); err == nil {
+			if err := forwardMoEBatch(ctx, reader, x, &c, &w, out, 2, Q40Options{}, nil); err == nil {
 				t.Fatal("expected validation error")
 			}
 		})
 	}
 	for _, batch := range []int{-1, 0, 1, int(^uint(0) >> 1)} {
-		if err := forward.ForwardMoEBatch(ctx, reader, x, cfg, lw, out, batch, forward.Q40Options{}); err == nil {
+		if err := forwardMoEBatch(ctx, reader, x, cfg, lw, out, batch, Q40Options{}, nil); err == nil {
 			t.Fatalf("accepted batch %d", batch)
 		}
 	}
 	for _, call := range []func() error{
-		func() error { return forward.ForwardMoEBatch(nil, reader, x, cfg, lw, out, 2, forward.Q40Options{}) },
-		func() error { return forward.ForwardMoEBatch(ctx, nil, x, cfg, lw, out, 2, forward.Q40Options{}) },
-		func() error { return forward.ForwardMoEBatch(ctx, reader, x, nil, lw, out, 2, forward.Q40Options{}) },
-		func() error { return forward.ForwardMoEBatch(ctx, reader, x, cfg, nil, out, 2, forward.Q40Options{}) },
+		func() error { return forwardMoEBatch(nil, reader, x, cfg, lw, out, 2, Q40Options{}, nil) },
+		func() error { return forwardMoEBatch(ctx, nil, x, cfg, lw, out, 2, Q40Options{}, nil) },
+		func() error { return forwardMoEBatch(ctx, reader, x, nil, lw, out, 2, Q40Options{}, nil) },
+		func() error { return forwardMoEBatch(ctx, reader, x, cfg, nil, out, 2, Q40Options{}, nil) },
 		func() error {
-			return forward.ForwardMoEBatch(ctx, reader, x, cfg, lw, out[:63], 2, forward.Q40Options{})
+			return forwardMoEBatch(ctx, reader, x, cfg, lw, out[:63], 2, Q40Options{}, nil)
 		},
-		func() error { return forward.ForwardMoEBatch(ctx, reader, x, cfg, lw, x, 2, forward.Q40Options{}) },
+		func() error { return forwardMoEBatch(ctx, reader, x, cfg, lw, x, 2, Q40Options{}, nil) },
 	} {
 		if err := call(); err == nil {
 			t.Fatal("expected validation error")
@@ -231,7 +230,7 @@ func TestForwardMoEBatchValidation(t *testing.T) {
 		if reverse {
 			x, y = y, x
 		}
-		if err := forward.ForwardMoEBatch(ctx, reader, x, cfg, lw, y, 2, forward.Q40Options{}); err == nil {
+		if err := forwardMoEBatch(ctx, reader, x, cfg, lw, y, 2, Q40Options{}, nil); err == nil {
 			t.Fatal("accepted partial overlap")
 		}
 	}
@@ -255,7 +254,7 @@ func TestForwardMoEBatchCancellation(t *testing.T) {
 	x, out := make([]float32, 37*cfg.HiddenDim), make([]float32, 37*cfg.HiddenDim)
 	for _, limit := range []int64{1, 2, 60, 150} {
 		ctx := &moeBatchCancelContext{Context: context.Background(), limit: limit}
-		if err := forward.ForwardMoEBatch(ctx, reader, x, cfg, lw, out, 37, forward.Q40Options{Workers: 3}); !errors.Is(err, context.Canceled) {
+		if err := forwardMoEBatch(ctx, reader, x, cfg, lw, out, 37, Q40Options{Workers: 3}, nil); !errors.Is(err, context.Canceled) {
 			t.Fatalf("limit%d: got %v", limit, err)
 		}
 	}
@@ -274,9 +273,9 @@ func BenchmarkForwardMoEBatch(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				var err error
 				if batched {
-					err = forward.ForwardMoEBatch(context.Background(), reader, x, cfg, lw, out, batch, forward.Q40Options{Workers: 1})
+					err = forwardMoEBatch(context.Background(), reader, x, cfg, lw, out, batch, Q40Options{Workers: 1}, nil)
 				} else {
-					err = moeBatchSequential(context.Background(), reader, x, cfg, lw, out, batch, forward.Q40Options{Workers: 1})
+					err = moeBatchSequential(context.Background(), reader, x, cfg, lw, out, batch, Q40Options{Workers: 1})
 				}
 				if err != nil {
 					b.Fatal(err)

@@ -17,65 +17,6 @@ const (
 	q80BlockBytes = 34
 )
 
-// MulQ80Into computes y = W*x where W is a Q8_0 quantized matrix.
-func MulQ80Into(
-	ctx context.Context,
-	reader *ggufmmap.Reader,
-	tensor ggufindex.Tensor,
-	x, y []float32,
-	options Q40Options,
-) error {
-	if ctx == nil {
-		return fmt.Errorf("nil context")
-	}
-	if reader == nil {
-		return fmt.Errorf("nil reader")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	input, output, rowBytes, err := q80Shape(tensor)
-	if err != nil {
-		return err
-	}
-	if len(x) != input || len(y) != output {
-		return fmt.Errorf("%q: expected %d input and %d output elements, got %d and %d",
-			tensor.Name, input, output, len(x), len(y))
-	}
-	if float32Overlap(x, y) {
-		return fmt.Errorf("input and output must not overlap")
-	}
-
-	windowBytes := options.WindowBytes
-	if windowBytes == 0 {
-		windowBytes = DefaultQ40WindowBytes
-	}
-	if windowBytes < uint64(rowBytes) {
-		return fmt.Errorf("window of %d bytes cannot accommodate a %d-byte row", windowBytes, rowBytes)
-	}
-
-	rowsPerWindow := int(min(windowBytes/uint64(rowBytes), uint64(output)))
-	workers := min(max(options.Workers, 1), runtime.GOMAXPROCS(0), rowsPerWindow)
-
-	pool := newQuantWorkers(workers, func(_ int, job quantRowJob) {
-		for row := job.begin; row < job.end; row++ {
-			if ctx.Err() != nil {
-				return
-			}
-			encoded := job.data[row*rowBytes : (row+1)*rowBytes]
-			y[job.firstRow+row] = dotQ80(encoded, x)
-		}
-	})
-	defer pool.close()
-	return reader.WithTensorChunks(tensor, uint64(rowsPerWindow)*uint64(rowBytes),
-		func(offset uint64, data []byte) error {
-			firstRow := int(offset / uint64(rowBytes))
-			rows := len(data) / rowBytes
-			pool.run(data, firstRow, rows)
-			return ctx.Err()
-		})
-}
-
 // MulQ80Argmax computes argmax(W*x) while streaming W, tracking the top token
 // without storing the complete logits vector.
 func MulQ80Argmax(

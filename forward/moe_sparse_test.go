@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -11,12 +11,11 @@ import (
 	"sort"
 	"testing"
 
-	"Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
 
-func scalarSparseMoE(t *testing.T, x []float32, cfg *forward.Config, lw *forward.LayerWeights) []float32 {
+func scalarSparseMoE(t *testing.T, x []float32, cfg *Config, lw *LayerWeights) []float32 {
 	t.Helper()
 	data, err := os.ReadFile(lw.FFNGateInp.Range.File)
 	if err != nil {
@@ -87,7 +86,7 @@ func TestSparseMoEIndependentReference(t *testing.T) {
 					x[i] = float32(i%13+1) / 16
 				}
 				for _, workers := range []int{1, 4} {
-					if err := forward.ForwardMoEBatch(context.Background(), reader, x, cfg, lw, out, batch, forward.Q40Options{Workers: workers}); err != nil {
+					if err := forwardMoEBatch(context.Background(), reader, x, cfg, lw, out, batch, Q40Options{Workers: workers}, nil); err != nil {
 						t.Fatal(err)
 					}
 					for token := range batch {
@@ -117,7 +116,7 @@ func BenchmarkSparseMoE(b *testing.B) {
 				b.ReportAllocs()
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					if err := forward.ForwardMoEBatch(context.Background(), reader, x, cfg, lw, out, batch, forward.Q40Options{Workers: workers}); err != nil {
+					if err := forwardMoEBatch(context.Background(), reader, x, cfg, lw, out, batch, Q40Options{Workers: workers}, nil); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -139,10 +138,10 @@ func TestSparseMoESelectedWeightBytes(t *testing.T) {
 					x[i] = .5
 				}
 				if batch == 1 {
-					if err := moeBatchSequential(context.Background(), reader, x, cfg, lw, out, batch, forward.Q40Options{Workers: 4}); err != nil {
+					if err := moeBatchSequential(context.Background(), reader, x, cfg, lw, out, batch, Q40Options{Workers: 4}); err != nil {
 						t.Fatal(err)
 					}
-				} else if err := forward.ForwardMoEBatch(context.Background(), reader, x, cfg, lw, out, batch, forward.Q40Options{Workers: 4}); err != nil {
+				} else if err := forwardMoEBatch(context.Background(), reader, x, cfg, lw, out, batch, Q40Options{Workers: 4}, nil); err != nil {
 					t.Fatal(err)
 				}
 				stats := reader.ExpertCacheStats()
@@ -189,7 +188,7 @@ func TestSparseMoEReversedProjectionLayout(t *testing.T) {
 		x[i] = float32(i%7-3) / 16
 	}
 	want := scalarSparseMoE(t, x, cfg, lw)
-	if err := moeBatchSequential(context.Background(), reader, x, cfg, lw, out, 1, forward.Q40Options{Workers: 4}); err != nil {
+	if err := moeBatchSequential(context.Background(), reader, x, cfg, lw, out, 1, Q40Options{Workers: 4}); err != nil {
 		t.Fatal(err)
 	}
 	for i, value := range want {

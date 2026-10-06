@@ -40,11 +40,6 @@ type Engine struct {
 	prefillScratch *prefillScratch
 }
 
-// NewEngine initializes the inference engine with default options.
-func NewEngine(model *ggufindex.Model, reader *ggufmmap.Reader) (*Engine, error) {
-	return NewEngineWithOptions(model, reader, EngineOptions{})
-}
-
 // NewEngineWithOptions initializes the inference engine with user-defined options.
 func NewEngineWithOptions(model *ggufindex.Model, reader *ggufmmap.Reader, options EngineOptions) (*Engine, error) {
 	if model == nil {

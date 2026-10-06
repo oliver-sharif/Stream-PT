@@ -1,14 +1,12 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
 	"fmt"
 	"math"
 	"testing"
-
-	"Stream-PT/forward"
 )
 
 func TestMXFP4NibbleReference(t *testing.T) {
@@ -38,7 +36,7 @@ func TestMXFP4NibbleReference(t *testing.T) {
 			reader, tensor := tensorFixture(t, 39, []uint64{uint64(input), rows, 1}, data)
 			out := make([]float32, rows)
 			for _, workers := range []int{1, 8} {
-				if err := forward.MulMXFP4Expert(context.Background(), reader, tensor, 0, x, nil, out, forward.Q40Options{Workers: workers}); err != nil {
+				if err := mulMXFP4ForTest(context.Background(), reader, tensor, 0, x, nil, out, Q40Options{Workers: workers}); err != nil {
 					t.Fatal(err)
 				}
 				for row, expected := range want {
@@ -65,7 +63,7 @@ func TestMXFP4AllScales(t *testing.T) {
 		x[i] = 1.0 / 32
 	}
 	reader, tensor := tensorFixture(t, 39, []uint64{32, 257, 1}, data)
-	if err := forward.MulMXFP4Expert(context.Background(), reader, tensor, 0, x, nil, out, forward.Q40Options{Workers: 8}); err != nil {
+	if err := mulMXFP4ForTest(context.Background(), reader, tensor, 0, x, nil, out, Q40Options{Workers: 8}); err != nil {
 		t.Fatal(err)
 	}
 	for scale := range 256 {

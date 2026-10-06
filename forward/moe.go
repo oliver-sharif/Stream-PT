@@ -25,19 +25,6 @@ func newMoEScratch(cfg *Config) *moeScratch {
 	return &moeScratch{}
 }
 
-// ForwardMoE routes the normalized activation vector to top-k experts and computes the FFN output.
-func ForwardMoE(ctx context.Context, reader *ggufmmap.Reader, x []float32, cfg *Config,
-	gateInpWeight, gateInpBias ggufindex.Tensor,
-	gateExpsWeight, gateExpsBias ggufindex.Tensor,
-	upExpsWeight, upExpsBias ggufindex.Tensor,
-	downExpsWeight, downExpsBias ggufindex.Tensor,
-	out []float32, options Q40Options,
-) error {
-	return forwardMoE(ctx, reader, x, cfg, gateInpWeight, gateInpBias,
-		gateExpsWeight, gateExpsBias, upExpsWeight, upExpsBias,
-		downExpsWeight, downExpsBias, out, options, nil)
-}
-
 func forwardMoE(ctx context.Context, reader *ggufmmap.Reader, x []float32, cfg *Config,
 	gateInpWeight, gateInpBias ggufindex.Tensor,
 	gateExpsWeight, gateExpsBias ggufindex.Tensor,

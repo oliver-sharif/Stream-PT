@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	. "Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
@@ -130,7 +129,7 @@ func TestRoPEAndAttention(t *testing.T) {
 	cache := NewKVCache(1, 10, numKVHeads, headDim)
 	out := make([]float32, hiddenDim)
 
-	ForwardAttention(q, k, v, cache, 0, 0, numHeads, numKVHeads, headDim, out, AttentionOptions{})
+	attentionForTest(q, k, v, cache, 0, 0, numHeads, numKVHeads, headDim, out, AttentionOptions{})
 
 	var hasNonZero bool
 	for _, val := range out {
@@ -160,7 +159,7 @@ func TestQ80Dot(t *testing.T) {
 
 	reader, tensor := tensorFixture(t, 8, []uint64{elements, 1}, row)
 	y := make([]float32, 1)
-	if err := MulQ80Into(context.Background(), reader, tensor, x, y, Q40Options{}); err != nil {
+	if err := q80KernelRowsForTest(reader, tensor, x, y); err != nil {
 		t.Fatal(err)
 	}
 	got := y[0]
@@ -190,7 +189,7 @@ func TestMXFP4Dot(t *testing.T) {
 
 	reader, tensor := tensorFixture(t, 39, []uint64{elements, 1, 1}, row)
 	y := make([]float32, 1)
-	if err := MulMXFP4Expert(context.Background(), reader, tensor, 0, x, nil, y, Q40Options{}); err != nil {
+	if err := mulMXFP4ForTest(context.Background(), reader, tensor, 0, x, nil, y, Q40Options{}); err != nil {
 		t.Fatal(err)
 	}
 	got := y[0]

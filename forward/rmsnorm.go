@@ -13,31 +13,6 @@ import (
 	ggufmmap "Stream-PT/ggufmap"
 )
 
-// RMSNorm computes y[i] = x[i] * weight[i] /
-// sqrt(mean(x[j]*x[j]) + epsilon).
-//
-// The weight tensor must be one-dimensional F32, F16, or BF16.
-// The result is a new vector; x remains unchanged.
-func RMSNorm(
-	ctx context.Context,
-	reader *ggufmmap.Reader,
-	weight ggufindex.Tensor,
-	x []float32,
-	epsilon float32,
-) ([]float32, error) {
-	if ctx == nil {
-		return nil, fmt.Errorf("nil context")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	y := make([]float32, len(x))
-	if err := RMSNormInto(ctx, reader, weight, x, y, epsilon); err != nil {
-		return nil, err
-	}
-	return y, nil
-}
-
 // RMSNormInto reuses y and supports exact in-place normalization (x == y).
 // Partial overlap is rejected. On error y may be partially written.
 // Do not close reader during computation.

@@ -8,7 +8,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"sort"
 )
 
 // MetadataValue identifies a GGUF metadata value in its source file.
@@ -16,73 +15,6 @@ import (
 type MetadataValue struct {
 	Type  uint32
 	Range Range
-}
-
-// WriteJSON writes the model index, including every metadata value and tensor.
-// Metadata arrays are streamed instead of being retained in memory.
-func (m *Model) WriteJSON(w io.Writer) error {
-	if m == nil {
-		return fmt.Errorf("nil model")
-	}
-
-	header := struct {
-		Paths      []string `json:"paths"`
-		LayerCount int      `json:"layer_count"`
-		Alignment  uint64   `json:"alignment"`
-		Shared     []Tensor `json:"shared"`
-		Layers     []Layer  `json:"layers"`
-	}{
-		Paths: m.Paths, LayerCount: m.LayerCount, Alignment: m.Alignment,
-		Shared: m.Shared, Layers: m.Layers,
-	}
-
-	encoded, err := json.Marshal(header)
-	if err != nil {
-		return err
-	}
-	if len(encoded) == 0 || encoded[len(encoded)-1] != '}' {
-		return fmt.Errorf("invalid model JSON")
-	}
-	if _, err := w.Write(encoded[:len(encoded)-1]); err != nil {
-		return err
-	}
-	if _, err := io.WriteString(w, `,"metadata":{`); err != nil {
-		return err
-	}
-
-	keys := make([]string, 0, len(m.Metadata))
-	for key := range m.Metadata {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	for i, key := range keys {
-		if i != 0 {
-			if _, err := io.WriteString(w, ","); err != nil {
-				return err
-			}
-		}
-		name, err := json.Marshal(key)
-		if err != nil {
-			return err
-		}
-		if _, err := w.Write(name); err != nil {
-			return err
-		}
-
-		entry := m.Metadata[key]
-		if _, err := fmt.Fprintf(w, `:{"type":%d,"value":`, entry.Type); err != nil {
-			return err
-		}
-		if err := entry.WriteJSON(w); err != nil {
-			return fmt.Errorf("metadata %q: %w", key, err)
-		}
-		if _, err := io.WriteString(w, "}"); err != nil {
-			return err
-		}
-	}
-	_, err = io.WriteString(w, "}}\n")
-	return err
 }
 
 // WriteJSON writes one decoded metadata value without retaining arrays.

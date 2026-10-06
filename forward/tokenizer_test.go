@@ -1,13 +1,12 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 
-	. "Stream-PT/forward"
 	"Stream-PT/ggufindex"
 )
 

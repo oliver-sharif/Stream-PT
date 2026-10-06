@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	. "Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
@@ -83,7 +82,7 @@ func TestRMSNormFormats(t *testing.T) {
 			original := append([]float32(nil), x...)
 			epsilon := float32(1e-5)
 
-			got, err := RMSNorm(
+			got, err := rmsNormForTest(
 				context.Background(), reader, tensor, x, epsilon,
 			)
 			if err != nil {
@@ -150,7 +149,7 @@ func TestRMSNormRealGGUF(t *testing.T) {
 	// This is a fixed TEST VALUE, not a claim that epsilon was read
 	// from the GGUF metadata.
 	epsilon := float32(1e-5)
-	got, err := RMSNorm(
+	got, err := rmsNormForTest(
 		context.Background(), reader, weight, x, epsilon,
 	)
 	if err != nil {

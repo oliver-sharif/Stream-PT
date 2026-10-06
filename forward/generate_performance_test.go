@@ -1,6 +1,6 @@
 //go:build goexperiment.simd && linux
 
-package tests
+package forward
 
 import (
 	"context"
@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
@@ -81,7 +80,7 @@ func TestGenerateModelPerformance(t *testing.T) {
 					t.Fatal(err)
 				}
 				startInit := time.Now()
-				e, err := forward.NewEngineWithOptions(model, r, forward.EngineOptions{
+				e, err := NewEngineWithOptions(model, r, EngineOptions{
 					Workers: workers, WindowBytes: 64 << 20,
 				})
 				if err != nil {

@@ -173,17 +173,22 @@ func TestMappingCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertUnmapped(t, path)
-	layer := ggufindex.Layer{Tensors: []ggufindex.Tensor{tensor, tensor}}
-	if err := r.WithLayer(layer, func([]MappedTensor) error { return callbackErr }); !errors.Is(err, callbackErr) {
+	ranges := []ggufindex.Range{tensor.Range, {File: path, Start: uint64(2 * os.Getpagesize()), End: uint64(3 * os.Getpagesize())}}
+	if err := r.WithExpertRanges(ranges, func(_ int, data []byte) error {
+		if cap(data) != len(data) {
+			t.Fatal("expert capacity exceeds length")
+		}
+		return callbackErr
+	}); !errors.Is(err, callbackErr) {
 		t.Fatal(err)
 	}
 	assertUnmapped(t, path)
-	layer.Tensors[1].Range.End = ^uint64(0)
-	if err := r.WithLayer(layer, func([]MappedTensor) error {
-		t.Fatal("callback with invalid layer")
+	ranges[1].End = ^uint64(0)
+	if err := r.WithExpertRanges(ranges, func(int, []byte) error {
+		t.Fatal("callback with invalid ranges")
 		return nil
 	}); err == nil {
-		t.Fatal("invalid layer accepted")
+		t.Fatal("invalid ranges accepted")
 	}
 	assertUnmapped(t, path)
 }
@@ -205,8 +210,12 @@ func TestMunmapErrors(t *testing.T) {
 			return r.WithTensorChunks(tensor, tensor.Range.End, func(_ uint64, data []byte) error { return callback(data) })
 		},
 		func() error {
-			return r.WithLayer(ggufindex.Layer{Tensors: []ggufindex.Tensor{tensor, tensor}}, func(tensors []MappedTensor) error {
-				return callback(tensors[1].Data)
+			return r.WithExpertRanges([]ggufindex.Range{tensor.Range,
+				{File: path, Start: uint64(2 * os.Getpagesize()), End: uint64(3 * os.Getpagesize())}}, func(index int, data []byte) error {
+				if index == 0 {
+					return nil
+				}
+				return callback(data)
 			})
 		},
 	} {

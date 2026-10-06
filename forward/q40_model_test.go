@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	. "Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
@@ -79,7 +78,7 @@ func TestMulQ40RealGGUFRow(t *testing.T) {
 		x[i] = float32((i%17)-8) / 16
 	}
 
-	got, err := MulQ40(context.Background(), reader, firstRow, x, 1)
+	got, err := mulQ40ForTest(context.Background(), reader, firstRow, x, 1)
 	if err != nil {
 		t.Fatalf("SIMD multiplication of %q: %v", chosen.Name, err)
 	}

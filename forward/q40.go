@@ -30,33 +30,6 @@ type Q40Options struct {
 	WindowBytes uint64
 }
 
-// MulQ40 computes y = W*x without loading or fully dequantizing W.
-// Shape[0] is the input dimension; Shape[1] is the output dimension.
-// Use MulQ40Into to reuse the output allocation across inference steps.
-func MulQ40(
-	ctx context.Context,
-	reader *ggufmmap.Reader,
-	tensor ggufindex.Tensor,
-	x []float32,
-	workers int,
-) ([]float32, error) {
-	_, output, _, err := q40Shape(tensor)
-	if err != nil {
-		return nil, err
-	}
-	if ctx == nil {
-		return nil, fmt.Errorf("nil context")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	y := make([]float32, output)
-	if err := MulQ40Into(ctx, reader, tensor, x, y, Q40Options{Workers: workers}); err != nil {
-		return nil, err
-	}
-	return y, nil
-}
-
 // MulQ40Into writes W*x into y. x and y must not overlap.
 // On error y may be partially written. Do not close reader during computation.
 func MulQ40Into(ctx context.Context, reader *ggufmmap.Reader, tensor ggufindex.Tensor,

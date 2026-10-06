@@ -130,7 +130,7 @@ func Open(model *ggufindex.Model) (*Reader, error) {
 }
 
 // Close closes the files. Do not call it concurrently with WithTensor,
-// WithTensorChunks, WithExpertRanges, or WithLayer (including from callbacks).
+// WithTensorChunks, or WithExpertRanges (including from callbacks).
 func (r *Reader) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -210,38 +210,6 @@ func (r *Reader) WithTensorChunks(t ggufindex.Tensor, chunkBytes uint64, fn func
 		start += length
 	}
 	return nil
-}
-
-// WithLayer maps all tensors in a layer for the duration of fn.
-// The slices are read-only and become invalid when fn returns.
-func (r *Reader) WithLayer(layer ggufindex.Layer, fn func(tensors []MappedTensor) error) (err error) {
-	if fn == nil {
-		return fmt.Errorf("nil callback")
-	}
-
-	tensors := make([]MappedTensor, 0, len(layer.Tensors))
-	var unmaps []func() error
-	defer func() {
-		for i := len(unmaps) - 1; i >= 0; i-- {
-			err = errors.Join(err, unmaps[i]())
-		}
-	}()
-
-	for _, t := range layer.Tensors {
-		data, unmap, err := r.mapRange(t.Range)
-		if err != nil {
-			return fmt.Errorf("layer %d, tensor %q: %w", layer.Number, t.Name, err)
-		}
-		unmaps = append(unmaps, unmap)
-		tensors = append(tensors, MappedTensor{Tensor: t, Data: data})
-	}
-	return fn(tensors)
-}
-
-// MappedTensor pairs tensor metadata with its temporarily mapped bytes.
-type MappedTensor struct {
-	Tensor ggufindex.Tensor
-	Data   []byte // Valid only during the callback; do not modify.
 }
 
 func (r *Reader) mapRange(span ggufindex.Range) ([]byte, func() error, error) {

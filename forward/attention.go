@@ -40,7 +40,6 @@ func NewKVCache(numLayers, maxTokens, numKVHeads, headDim int) *KVCache {
 type AttentionOptions struct {
 	Sinks         []float32
 	SlidingWindow int
-	Scratch       *AttentionScratch // Optional caller-owned scratch; not safe for concurrent use.
 }
 
 // AttentionScratch reuses softmax scores and SIMD reduction storage.
@@ -55,25 +54,6 @@ func (s *AttentionScratch) prepare(positions, lanes int) {
 	if len(s.partials) != lanes {
 		s.partials = make([]float32, lanes)
 	}
-}
-
-// ForwardAttention computes Grouped Query Attention (GQA) using the KV cache.
-func ForwardAttention(
-	q, k, v []float32,
-	cache *KVCache,
-	layer, pos int,
-	numHeads, numKVHeads, headDim int,
-	out []float32, // length = numHeads * headDim
-	options AttentionOptions,
-) {
-	scratch := options.Scratch
-	if scratch == nil {
-		scratch = &AttentionScratch{}
-	}
-	var vector simd.Float32s
-	scratch.prepare(min(pos+1, cache.MaxPos), vector.Len())
-	forwardAttention(q, k, v, cache, layer, pos, numHeads, numKVHeads, headDim, out,
-		options, scratch.scores, scratch.partials)
 }
 
 func forwardAttention(

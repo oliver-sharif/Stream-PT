@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"bytes"
@@ -11,15 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
-)
-
-const (
-	q40Elements     = 32
-	q40BlockBytes   = 18
-	mxfp4BlockBytes = 17
 )
 
 func tensorFixture(t *testing.T, typ uint32, shape []uint64, data []byte) (*ggufmmap.Reader, ggufindex.Tensor) {
@@ -44,14 +37,14 @@ func tensorFixture(t *testing.T, typ uint32, shape []uint64, data []byte) (*gguf
 func multiplyQ40Row(t *testing.T, row []byte, x []float32) float32 {
 	t.Helper()
 	reader, tensor := tensorFixture(t, 2, []uint64{uint64(len(x)), 1}, row)
-	y, err := forward.MulQ40(context.Background(), reader, tensor, x, 1)
+	y, err := mulQ40ForTest(context.Background(), reader, tensor, x, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return y[0]
 }
 
-func tokenizerFixture(t *testing.T, tokens []string) *forward.Tokenizer {
+func tokenizerFixture(t *testing.T, tokens []string) *Tokenizer {
 	t.Helper()
 	var data bytes.Buffer
 	write := func(value any) {
@@ -69,7 +62,7 @@ func tokenizerFixture(t *testing.T, tokens []string) *forward.Tokenizer {
 	if err := os.WriteFile(path, data.Bytes(), 0600); err != nil {
 		t.Fatal(err)
 	}
-	tok, err := forward.LoadTokenizer(&ggufindex.Model{Metadata: map[string]ggufindex.MetadataValue{
+	tok, err := LoadTokenizer(&ggufindex.Model{Metadata: map[string]ggufindex.MetadataValue{
 		"tokenizer.ggml.tokens": {Type: 9, Range: ggufindex.Range{File: path, End: uint64(data.Len())}},
 	}})
 	if err != nil {

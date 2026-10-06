@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
@@ -89,12 +88,12 @@ func TestQuantOptimizationFloat16Scales(t *testing.T) {
 			}
 			quantOptimizationReplaceData(t, tensor, data)
 			y := make([]float32, output)
-			opts := forward.Q40Options{Workers: 4, WindowBytes: uint64(rowBytes * 257)}
+			opts := Q40Options{Workers: 4, WindowBytes: uint64(rowBytes * 257)}
 			var err error
 			if typ == 2 {
-				err = forward.MulQ40Into(context.Background(), reader, tensor, x, y, opts)
+				err = MulQ40Into(context.Background(), reader, tensor, x, y, opts)
 			} else {
-				err = forward.MulQ80Into(context.Background(), reader, tensor, x, y, opts)
+				err = q80KernelRowsForTest(reader, tensor, x, y)
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -147,19 +146,19 @@ func TestQuantOptimizationNumerics(t *testing.T) {
 				for _, workers := range []int{1, 4, 100} {
 					for _, rows := range []int{1, 4, 8, output} {
 						y := make([]float32, output)
-						opts := forward.Q40Options{Workers: workers, WindowBytes: uint64(rows*rowBytes + 1)}
+						opts := Q40Options{Workers: workers, WindowBytes: uint64(rows*rowBytes + 1)}
 						var err error
 						if typ == 2 {
-							err = forward.MulQ40Into(context.Background(), reader, tensor, x, y, opts)
+							err = MulQ40Into(context.Background(), reader, tensor, x, y, opts)
 						} else {
-							err = forward.MulQ80Into(context.Background(), reader, tensor, x, y, opts)
+							err = q80KernelRowsForTest(reader, tensor, x, y)
 						}
 						if err != nil {
 							t.Fatal(err)
 						}
 						compareVectors(t, y, want)
 						if typ == 8 {
-							token, logit, err := forward.MulQ80Argmax(context.Background(), reader, tensor, x, opts)
+							token, logit, err := MulQ80Argmax(context.Background(), reader, tensor, x, opts)
 							best := 0
 							for i := range y {
 								if y[i] > y[best] {
@@ -181,8 +180,8 @@ func TestQuantOptimizationArgmaxWindowAndTies(t *testing.T) {
 	reader, tensor, data := quantOptimizationFixture(t, 8, 32, 17)
 	x := make([]float32, 32)
 	for _, size := range []uint64{1, 33} {
-		if _, _, err := forward.MulQ80Argmax(context.Background(), reader, tensor, x,
-			forward.Q40Options{Workers: 4, WindowBytes: size}); err == nil || !strings.Contains(err.Error(), "cannot accommodate") {
+		if _, _, err := MulQ80Argmax(context.Background(), reader, tensor, x,
+			Q40Options{Workers: 4, WindowBytes: size}); err == nil || !strings.Contains(err.Error(), "cannot accommodate") {
 			t.Fatalf("%d-byte window: expected row-size validation, got %v", size, err)
 		}
 	}
@@ -202,8 +201,8 @@ func TestQuantOptimizationArgmaxWindowAndTies(t *testing.T) {
 		for _, workers := range []int{1, 4, 100} {
 			for _, rows := range []int{1, 4, 8, 17} {
 				for range 5 {
-					token, logit, err := forward.MulQ80Argmax(context.Background(), reader, tensor, x,
-						forward.Q40Options{Workers: workers, WindowBytes: uint64(rows * 34)})
+					token, logit, err := MulQ80Argmax(context.Background(), reader, tensor, x,
+						Q40Options{Workers: workers, WindowBytes: uint64(rows * 34)})
 					if err != nil || token != best || logit != wantLogit {
 						t.Fatalf("ties: workers=%d rows=%d got %d/%g/%v, want %d/%g", workers, rows, token, logit, err, best, wantLogit)
 					}
@@ -230,16 +229,14 @@ func (c *quantRecordingContext) Err() error {
 }
 
 func quantOptimizationRun(ctx context.Context, reader *ggufmmap.Reader, tensor ggufindex.Tensor,
-	x, y []float32, mode string, opts forward.Q40Options) error {
+	x, y []float32, mode string, opts Q40Options) error {
 	switch mode {
 	case "q40":
-		return forward.MulQ40Into(ctx, reader, tensor, x, y, opts)
+		return MulQ40Into(ctx, reader, tensor, x, y, opts)
 	case "q40batch":
-		return forward.MulQ40BatchInto(ctx, reader, tensor, x, y, 4, opts)
-	case "q80":
-		return forward.MulQ80Into(ctx, reader, tensor, x, y, opts)
+		return MulQ40BatchInto(ctx, reader, tensor, x, y, 4, opts)
 	default:
-		_, _, err := forward.MulQ80Argmax(ctx, reader, tensor, x, opts)
+		_, _, err := MulQ80Argmax(ctx, reader, tensor, x, opts)
 		return err
 	}
 }
@@ -247,7 +244,7 @@ func quantOptimizationRun(ctx context.Context, reader *ggufmmap.Reader, tensor g
 func TestQuantOptimizationPersistentWorkers(t *testing.T) {
 	previous := runtime.GOMAXPROCS(4)
 	defer runtime.GOMAXPROCS(previous)
-	for _, mode := range []string{"q40", "q40batch", "q80", "argmax"} {
+	for _, mode := range []string{"q40", "q40batch", "argmax"} {
 		t.Run(mode, func(t *testing.T) {
 			typ, batch, blockBytes := uint32(2), 1, 18
 			if mode == "q80" || mode == "argmax" {
@@ -259,7 +256,7 @@ func TestQuantOptimizationPersistentWorkers(t *testing.T) {
 			reader, tensor, _ := quantOptimizationFixture(t, typ, 32, 33)
 			ctx := &quantRecordingContext{Context: context.Background(), ids: make(map[string]bool)}
 			if err := quantOptimizationRun(ctx, reader, tensor, make([]float32, batch*32), make([]float32, batch*33), mode,
-				forward.Q40Options{Workers: 4, WindowBytes: uint64(4 * blockBytes)}); err != nil {
+				Q40Options{Workers: 4, WindowBytes: uint64(4 * blockBytes)}); err != nil {
 				t.Fatal(err)
 			}
 			if len(ctx.ids) != 5 {
@@ -287,7 +284,7 @@ func (c *quantBlockingContext) Err() error {
 func TestQuantOptimizationCancellationJoins(t *testing.T) {
 	previous := runtime.GOMAXPROCS(4)
 	defer runtime.GOMAXPROCS(previous)
-	for _, mode := range []string{"q40", "q40batch", "q80", "argmax"} {
+	for _, mode := range []string{"q40", "q40batch", "argmax"} {
 		t.Run(mode, func(t *testing.T) {
 			typ, batch, blockBytes := uint32(2), 1, 18
 			if mode == "q80" || mode == "argmax" {
@@ -301,7 +298,7 @@ func TestQuantOptimizationCancellationJoins(t *testing.T) {
 			defer cancel()
 			ctx := &quantBlockingContext{Context: base, entered: make(chan struct{}, 64), release: make(chan struct{})}
 			x, y := make([]float32, batch*32), make([]float32, batch*17)
-			opts := forward.Q40Options{Workers: 4, WindowBytes: uint64(4 * blockBytes)}
+			opts := Q40Options{Workers: 4, WindowBytes: uint64(4 * blockBytes)}
 			result := make(chan error, 1)
 			go func() { result <- quantOptimizationRun(ctx, reader, tensor, x, y, mode, opts) }()
 			for range 4 {
@@ -337,7 +334,7 @@ func TestQuantOptimizationCancellationJoins(t *testing.T) {
 
 func BenchmarkQuantOptimization(b *testing.B) {
 	const input, output = 512, 1024
-	for _, mode := range []string{"q40", "q40batch", "q80", "argmax"} {
+	for _, mode := range []string{"q40", "q40batch", "argmax"} {
 		typ, batch, blockBytes := uint32(2), 1, 18
 		if mode == "q80" || mode == "argmax" {
 			typ, blockBytes = 8, 34
@@ -353,7 +350,7 @@ func BenchmarkQuantOptimization(b *testing.B) {
 		for _, workers := range []int{1, 4} {
 			for _, rows := range []int{4, 32, output} {
 				b.Run(fmt.Sprintf("%s/workers%d/rows%d", mode, workers, rows), func(b *testing.B) {
-					opts := forward.Q40Options{Workers: workers, WindowBytes: uint64(rows * input / 32 * blockBytes)}
+					opts := Q40Options{Workers: workers, WindowBytes: uint64(rows * input / 32 * blockBytes)}
 					b.ReportAllocs()
 					b.SetBytes(int64(tensor.Range.End - tensor.Range.Start))
 					b.ResetTimer()
@@ -371,7 +368,7 @@ func BenchmarkQuantOptimization(b *testing.B) {
 func TestQuantOptimizationQ80ShapeOverflow(t *testing.T) {
 	reader, tensor, _ := quantOptimizationFixture(t, 8, 32, 1)
 	tensor.Shape = []uint64{32, math.MaxUint64}
-	if _, _, err := forward.MulQ80Argmax(context.Background(), reader, tensor, make([]float32, 32), forward.Q40Options{}); err == nil {
+	if _, _, err := MulQ80Argmax(context.Background(), reader, tensor, make([]float32, 32), Q40Options{}); err == nil {
 		t.Fatal("accepted overflowing output shape")
 	}
 }

@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -11,7 +11,6 @@ import (
 	"simd"
 	"testing"
 
-	"Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
@@ -62,11 +61,11 @@ func BenchmarkForwardQuantized(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				switch typ {
 				case 2:
-					err = forward.MulQ40Into(ctx, reader, tensor, x, y, forward.Q40Options{Workers: 1})
+					err = MulQ40Into(ctx, reader, tensor, x, y, Q40Options{Workers: 1})
 				case 8:
-					err = forward.MulQ80Into(ctx, reader, tensor, x, y, forward.Q40Options{Workers: 1})
+					_, _, err = MulQ80Argmax(ctx, reader, tensor, x, Q40Options{Workers: 1})
 				case 39:
-					err = forward.MulMXFP4Expert(ctx, reader, tensor, 0, x, nil, y, forward.Q40Options{Workers: 1})
+					err = mulMXFP4ForTest(ctx, reader, tensor, 0, x, nil, y, Q40Options{Workers: 1})
 				}
 				if err != nil {
 					b.Fatal(err)
@@ -80,7 +79,7 @@ func BenchmarkForwardAttention(b *testing.B) {
 	for _, window := range []int{0, 128} {
 		b.Run(fmt.Sprintf("window%d", window), func(b *testing.B) {
 			const heads, kvHeads, dim, positions = 64, 8, 64, 512
-			cache := forward.NewKVCache(1, positions, kvHeads, dim)
+			cache := NewKVCache(1, positions, kvHeads, dim)
 			q, k, v := make([]float32, heads*dim), make([]float32, kvHeads*dim), make([]float32, kvHeads*dim)
 			out := make([]float32, len(q))
 			for i := range q {
@@ -95,8 +94,8 @@ func BenchmarkForwardAttention(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				forward.ForwardAttention(q, k, v, cache, 0, positions-1, heads, kvHeads, dim, out,
-					forward.AttentionOptions{SlidingWindow: window})
+				attentionForTest(q, k, v, cache, 0, positions-1, heads, kvHeads, dim, out,
+					AttentionOptions{SlidingWindow: window})
 			}
 		})
 	}

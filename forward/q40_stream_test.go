@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	. "Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
@@ -61,7 +60,7 @@ func BenchmarkMulQ40(b *testing.B) {
 	b.SetBytes(int64(tensor.Range.End - tensor.Range.Start))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := MulQ40(context.Background(), reader, tensor, x, 1); err != nil {
+		if _, err := mulQ40ForTest(context.Background(), reader, tensor, x, 1); err != nil {
 			b.Fatal(err)
 		}
 	}

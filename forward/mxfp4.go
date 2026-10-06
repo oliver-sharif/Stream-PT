@@ -3,15 +3,8 @@
 package forward
 
 import (
-	"context"
-	"fmt"
 	"math"
-	"runtime"
 	"simd"
-	"sync"
-
-	"Stream-PT/ggufindex"
-	ggufmmap "Stream-PT/ggufmap"
 )
 
 // Precomputed E8M0 scale table (2^(b - 127)).
@@ -38,86 +31,6 @@ const (
 	mxfp4Elements   = 32
 	mxfp4BlockBytes = 17
 )
-
-// MulMXFP4Expert computes y = W_expert * x + bias for a specific expert index.
-func MulMXFP4Expert(
-	ctx context.Context,
-	reader *ggufmmap.Reader,
-	tensor ggufindex.Tensor,
-	expertIdx int,
-	x, bias, y []float32,
-	options Q40Options,
-) error {
-	if ctx == nil {
-		return fmt.Errorf("nil context")
-	}
-	if reader == nil {
-		return fmt.Errorf("nil reader")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if len(tensor.Shape) != 3 {
-		return fmt.Errorf("%q: expected 3D expert tensor, got shape %v", tensor.Name, tensor.Shape)
-	}
-	inDim, outDim, numExperts := int(tensor.Shape[0]), int(tensor.Shape[1]), int(tensor.Shape[2])
-	if expertIdx < 0 || expertIdx >= numExperts {
-		return fmt.Errorf("expert index %d out of bounds [0, %d)", expertIdx, numExperts)
-	}
-	if len(x) != inDim || len(y) != outDim {
-		return fmt.Errorf("%q: dimension mismatch (x=%d in=%d, y=%d out=%d)",
-			tensor.Name, len(x), inDim, len(y), outDim)
-	}
-	if err := validateMoEBatchExpert(tensor, inDim, outDim, numExperts); err != nil {
-		return err
-	}
-
-	blocksPerRow := inDim / mxfp4Elements
-	rowBytes := uint64(blocksPerRow * mxfp4BlockBytes)
-	expertBytes := uint64(outDim) * rowBytes
-	expertOffset := uint64(expertIdx) * expertBytes
-
-	span := ggufindex.Range{
-		File:  tensor.Range.File,
-		Start: tensor.Range.Start + expertOffset,
-		End:   tensor.Range.Start + expertOffset + expertBytes,
-	}
-
-	return reader.WithExpertRanges([]ggufindex.Range{span}, func(_ int, data []byte) error {
-		if uint64(len(data)) < expertBytes {
-			return fmt.Errorf("short read for expert %d: %d < %d", expertIdx, len(data), expertBytes)
-		}
-		workers := min(max(options.Workers, 1), runtime.GOMAXPROCS(0), outDim)
-		compute := func(begin, end int) {
-			for r := begin; r < end; r++ {
-				if ctx.Err() != nil {
-					return
-				}
-				rowData := data[uint64(r)*rowBytes : uint64(r+1)*rowBytes]
-				val := dotMXFP4(rowData, x)
-				if bias != nil && len(bias) > r {
-					val += bias[r]
-				}
-				y[r] = val
-			}
-		}
-		if workers <= 1 {
-			compute(0, outDim)
-		} else {
-			var wg sync.WaitGroup
-			for w := 0; w < workers; w++ {
-				begin, end := w*outDim/workers, (w+1)*outDim/workers
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					compute(begin, end)
-				}()
-			}
-			wg.Wait()
-		}
-		return ctx.Err()
-	})
-}
 
 func dotMXFP4(row []byte, x []float32) float32 {
 	if value, ok := dotMXFP4Fast(row, x); ok {

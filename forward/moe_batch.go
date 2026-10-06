@@ -73,14 +73,8 @@ func newMoEBatchScratch(cfg *Config, batch int) (*moeBatchScratch, error) {
 	}, nil
 }
 
-// ForwardMoEBatch computes MoE for flattened [batch, HiddenDim] activations.
+// forwardMoEBatch computes MoE for flattened [batch, HiddenDim] activations.
 // Input and output must not overlap. Only routed experts are mapped, in physical order.
-func ForwardMoEBatch(ctx context.Context, reader *ggufmmap.Reader, x []float32, cfg *Config,
-	lw *LayerWeights, out []float32, batch int, options Q40Options,
-) error {
-	return forwardMoEBatch(ctx, reader, x, cfg, lw, out, batch, options, nil)
-}
-
 func forwardMoEBatch(ctx context.Context, reader *ggufmmap.Reader, x []float32, cfg *Config,
 	lw *LayerWeights, out []float32, batch int, options Q40Options, scratch *moeBatchScratch,
 ) error {

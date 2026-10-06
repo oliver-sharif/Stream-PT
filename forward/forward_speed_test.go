@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -9,8 +9,6 @@ import (
 	"math"
 	"reflect"
 	"testing"
-
-	. "Stream-PT/forward"
 )
 
 func TestQuantizedSIMDReference(t *testing.T) {
@@ -64,9 +62,9 @@ func TestQuantizedSIMDReference(t *testing.T) {
 				options := Q40Options{Workers: workers, WindowBytes: uint64(3 * rowBytes)}
 				var err error
 				if typ == 8 {
-					err = MulQ80Into(context.Background(), reader, tensor, x, y, options)
+					err = q80KernelRowsForTest(reader, tensor, x, y)
 				} else {
-					err = MulMXFP4Expert(context.Background(), reader, tensor, 0, x, nil, y, options)
+					err = mulMXFP4ForTest(context.Background(), reader, tensor, 0, x, nil, y, options)
 				}
 				if err != nil {
 					t.Fatal(err)
@@ -110,7 +108,7 @@ func TestAttentionSIMDReference(t *testing.T) {
 						v[i] = float32((i+pos)%23-11) / 16
 					}
 					options := AttentionOptions{Sinks: []float32{0, 1, -1, 2}, SlidingWindow: window}
-					ForwardAttention(q, k, v, cache, 0, pos, heads, kvHeads, dim, out, options)
+					attentionForTest(q, k, v, cache, 0, pos, heads, kvHeads, dim, out, options)
 					want := make([]float32, len(q))
 					start := 0
 					if window > 0 {

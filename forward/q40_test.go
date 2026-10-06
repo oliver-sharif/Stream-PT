@@ -1,14 +1,12 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
 	"encoding/binary"
 	"math"
 	"testing"
-
-	. "Stream-PT/forward"
 )
 
 func TestDotQ40(t *testing.T) {

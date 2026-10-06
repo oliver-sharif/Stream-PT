@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"context"
@@ -11,9 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"simd"
 	"testing"
 
-	. "Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
@@ -280,8 +280,13 @@ func TestAttentionScratchNoAllocations(t *testing.T) {
 			cache.Values[0][pos][i] = float32((i+pos)%9-4) / 8
 		}
 	}
-	options := AttentionOptions{Scratch: &AttentionScratch{}, Sinks: []float32{0, 1}, SlidingWindow: 5}
-	call := func() { ForwardAttention(q, k, v, cache, 0, 15, 2, 1, 7, out, options) }
+	options := AttentionOptions{Sinks: []float32{0, 1}, SlidingWindow: 5}
+	var vector simd.Float32s
+	var scratch AttentionScratch
+	scratch.prepare(16, vector.Len())
+	call := func() {
+		forwardAttention(q, k, v, cache, 0, 15, 2, 1, 7, out, options, scratch.scores, scratch.partials)
+	}
 	call()
 	want := append([]float32(nil), out...)
 	if allocs := testing.AllocsPerRun(100, call); allocs != 0 {
@@ -290,7 +295,7 @@ func TestAttentionScratchNoAllocations(t *testing.T) {
 	if !reflect.DeepEqual(out, want) {
 		t.Fatal("scratch reuse changed output")
 	}
-	ForwardAttention(q, k, v, cache, 0, 15, 2, 1, 7, out, AttentionOptions{Sinks: options.Sinks, SlidingWindow: 5})
+	attentionForTest(q, k, v, cache, 0, 15, 2, 1, 7, out, AttentionOptions{Sinks: options.Sinks, SlidingWindow: 5})
 	compareVectors(t, want, out)
 }
 

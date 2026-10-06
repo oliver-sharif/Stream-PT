@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"bytes"
@@ -12,7 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	. "Stream-PT/forward"
 	"Stream-PT/ggufindex"
 	ggufmmap "Stream-PT/ggufmap"
 )
@@ -90,7 +89,7 @@ func TestGPTOSSExpertBiasesAndSwiGLU(t *testing.T) {
 	t.Cleanup(func() { _ = reader.Close() })
 	cfg := &Config{HiddenDim: dim, ExpertHiddenDim: dim, NumExperts: experts, NumExpertsUsed: 1}
 	out := make([]float32, dim)
-	err = ForwardMoE(context.Background(), reader, make([]float32, dim), cfg,
+	err = moeForTest(context.Background(), reader, make([]float32, dim), cfg,
 		router, routerBias, gate, gateBias, up, upBias, down, downBias, out, Q40Options{Workers: 2})
 	if err != nil {
 		t.Fatal(err)
@@ -106,7 +105,7 @@ func TestGPTOSSExpertBiasesAndSwiGLU(t *testing.T) {
 func TestGPTOSSAttentionSink(t *testing.T) {
 	cache := NewKVCache(1, 1, 1, 2)
 	out := make([]float32, 2)
-	ForwardAttention([]float32{0, 0}, []float32{0, 0}, []float32{2, 4}, cache, 0, 0, 1, 1, 2, out,
+	attentionForTest([]float32{0, 0}, []float32{0, 0}, []float32{2, 4}, cache, 0, 0, 1, 1, 2, out,
 		AttentionOptions{Sinks: []float32{0}})
 	// A zero-logit sink takes half of the probability mass, with a zero value.
 	compareVectors(t, out, []float32{1, 2})

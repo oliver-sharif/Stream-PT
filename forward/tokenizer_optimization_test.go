@@ -1,6 +1,6 @@
 //go:build goexperiment.simd
 
-package tests
+package forward
 
 import (
 	"bytes"
@@ -15,7 +15,6 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	. "Stream-PT/forward"
 	"Stream-PT/ggufindex"
 )
 
