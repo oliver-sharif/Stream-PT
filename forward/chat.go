@@ -4,10 +4,19 @@ package forward
 
 import "fmt"
 
-// EncodeChatPrompt frames a user message and starts a GPT-OSS Harmony final answer.
-func (t *Tokenizer) EncodeChatPrompt(prompt string) ([]int, error) {
+// ChatMessage represents a single message in a conversation.
+type ChatMessage struct {
+	Role    string `json:"role"`    // "system", "user", "assistant"
+	Content string `json:"content"` // message content
+}
+
+// EncodeChatMessages encodes a conversation history and starts a GPT-OSS Harmony final answer.
+func (t *Tokenizer) EncodeChatMessages(messages []ChatMessage) ([]int, error) {
 	if t == nil {
 		return nil, fmt.Errorf("nil tokenizer")
+	}
+	if len(messages) == 0 {
+		return nil, fmt.Errorf("empty messages")
 	}
 	specialID := func(names ...string) (int, error) {
 		for _, name := range names {
@@ -34,15 +43,33 @@ func (t *Tokenizer) EncodeChatPrompt(prompt string) ([]int, error) {
 		return nil, err
 	}
 
-	// Insert control token IDs directly; Encode treats the user input as ordinary text.
-	tokens := []int{start}
-	tokens = append(tokens, t.Encode("user")...)
-	tokens = append(tokens, message)
-	tokens = append(tokens, t.Encode(prompt)...)
-	tokens = append(tokens, end, start)
+	var tokens []int
+	for _, msg := range messages {
+		role := msg.Role
+		if role == "" {
+			role = "user"
+		}
+		tokens = append(tokens, start)
+		tokens = append(tokens, t.Encode(role)...)
+		if role == "assistant" {
+			tokens = append(tokens, channel)
+			tokens = append(tokens, t.Encode("final")...)
+		}
+		tokens = append(tokens, message)
+		tokens = append(tokens, t.Encode(msg.Content)...)
+		tokens = append(tokens, end)
+	}
+
+	// Trigger assistant completion
+	tokens = append(tokens, start)
 	tokens = append(tokens, t.Encode("assistant")...)
 	tokens = append(tokens, channel)
 	tokens = append(tokens, t.Encode("final")...)
 	tokens = append(tokens, message)
 	return tokens, nil
+}
+
+// EncodeChatPrompt frames a user message and starts a GPT-OSS Harmony final answer.
+func (t *Tokenizer) EncodeChatPrompt(prompt string) ([]int, error) {
+	return t.EncodeChatMessages([]ChatMessage{{Role: "user", Content: prompt}})
 }

@@ -1,0 +1,12 @@
+# Generated binaries and profiling artifacts.
+/bin/
+*.test
+*.pprof
+*.prof
+coverage.out
+
+# Local model weights.
+/model/
+
+# Local JetBrains IDE settings.
+/.idea/
