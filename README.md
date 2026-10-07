@@ -1,74 +1,181 @@
 # Stream-PT
 
-## Description
+[![Go Version](https://img.shields.io/badge/Go-1.27.1%20(experimental.simd)-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Model](https://img.shields.io/badge/Verified%20Model-GPT--OSS--120B%20Q4__0-8A2BE2)](https://huggingface.co/unsloth/gpt-oss-120b-GGUF/tree/main/Q4_0)
+[![Inference](https://img.shields.io/badge/Architecture-Disk--Streaming%20Mmap%20%2B%20SIMD-orange)](#architecture--how-it-works)
+[![Status](https://img.shields.io/badge/Status-Experimental%20%2F%20Active%20WIP-yellow)](#experimental-status--breaking-changes)
 
-Stream-PT runs GPT-OSS inference on a CPU using Go's experimental SIMD support.
-GGUF weights stay file-backed and are read through memory-mapped windows rather
-than copied into the Go heap. The CLI processes a chat prompt and prints generated
-tokens using configurable sampling. Generation ends at an EOS token (including
-`<|end|>`) or the token limit. The KV cache has 2,048 positions.
+> **Empowering commodity hardware to run massive 120-billion parameter models directly from SSD.**
 
-## Usage
+**Stream-PT** is an experimental CPU inference engine written in Go designed to run **GPT-OSS-120B** on virtually any machine equipped with a reasonably fast solid-state drive (NVMe / SATA SSD). By reading GGUF weights on-demand through memory-mapped chunks rather than loading the entire 60+ GB model into RAM or VRAM, Stream-PT bypasses high system memory requirements and leverages Go's upcoming native SIMD vectorization for execution.
 
-Requires Linux and Go 1.27 with `GOEXPERIMENT=simd`. Place both model shards in
-`model/`:
+---
 
-```text
-model/gpt-oss-120b-Q4_0-00001-of-00002.gguf
-model/gpt-oss-120b-Q4_0-00002-of-00002.gguf
-```
+### ⚠️ Experimental Status & Breaking Changes
 
-Run from the project root:
+> **Note**: Stream-PT is an ongoing proof-of-concept and research project. 
+> - Development is active, rapid, and subject to frequent updates.
+> - **Expect breaking changes, API refactoring, and code adjustments.**
+> - We welcome feedback, benchmarks, and issue reports as we push CPU streaming to its limits.
+
+---
+
+## ⚡ Key Features
+
+- **Disk-to-CPU Streaming Engine**: Streams model weights layer-by-layer directly from storage via `mmap` sliding windows. You do not need 70+ GB of system RAM or enterprise GPUs to run a 120B model.
+- **Go Experimental SIMD Acceleration**: Built on Go 1.27.1 with `GOEXPERIMENT=simd` for high-throughput, vectorized CPU tensor arithmetic.
+- **Modern Interactive Web UI**:
+  - Live token streaming via Server-Sent Events (SSE).
+  - Clean, dark-mode browser interface.
+  - Interactive parameter drawer: adjust Max Tokens, Temperature, Repetition Penalty, System Prompts, Top-K, Top-P, and Min-P on the fly.
+  - Live system diagnostics: displays active CPU model, RAM, layer count, worker threads, and chunk window size.
+  - Client-side history and local storage settings persistence.
+- **MoE Optimization & Hot-Expert Caching**:
+  - Configurable locked memory cache for frequently activated Mixture-of-Experts (MoE) matrices.
+  - Integrated expert lookahead and prefetching to mask disk I/O latency.
+- **CLI & Web Server Modes**: Run in the terminal for batch/script generation or start the web server for conversational chat.
+
+---
+
+## 🎯 Verified & Supported Model
+
+Currently, Stream-PT has been developed, tested, and validated exclusively against the **Q4_0 quantization of GPT-OSS-120B**:
+
+* **Model Repository**: [unsloth/gpt-oss-120b-GGUF (Q4_0)](https://huggingface.co/unsloth/gpt-oss-120b-GGUF/tree/main/Q4_0)
+* **Required Files (shards)**:
+  - `model/gpt-oss-120b-Q4_0-00001-of-00002.gguf`
+  - `model/gpt-oss-120b-Q4_0-00002-of-00002.gguf`
+
+*Other models, architectures, or quantization types are not yet officially supported or guaranteed to function.*
+
+---
+
+## 🚀 Quick Start
+
+### 1. Prerequisites
+
+- **OS**: Linux (x86_64 or ARM64)
+- **Go**: Go 1.27.1+ with experimental SIMD support
+- **Hardware**: Any modern multi-core CPU and an SSD with at least ~70 GB of free space.
+
+### 2. Download the Model
+
+Create the `model/` directory and place both GGUF shard files inside:
 
 ```sh
-GOEXPERIMENT=simd go run . -p "Write a small hello-world program in Python" -n 200
+mkdir -p model
+cd model
+
+# Download the two Q4_0 shards from Hugging Face
+wget https://huggingface.co/unsloth/gpt-oss-120b-GGUF/resolve/main/Q4_0/gpt-oss-120b-Q4_0-00001-of-00002.gguf
+wget https://huggingface.co/unsloth/gpt-oss-120b-GGUF/resolve/main/Q4_0/gpt-oss-120b-Q4_0-00002-of-00002.gguf
+
+cd ..
 ```
 
-Alternatively, build and run:
+### 3. Build & Run
+
+#### Running the Web UI (Default)
+
+Launch the integrated chat server:
+
+```sh
+GOEXPERIMENT=simd go run .
+```
+
+Open your browser and navigate to **[http://localhost:8080](http://localhost:8080)**.
+
+#### Running CLI Inference
+
+To generate responses directly in the terminal, provide the prompt using the `-p` / `-prompt` flag or as positional arguments:
+
+```sh
+GOEXPERIMENT=simd go run . -p "Explain how memory mapping works in modern operating systems." -n 256
+```
+
+#### Compiling a Binary
 
 ```sh
 GOEXPERIMENT=simd go build -o bin/stream-pt .
-./bin/stream-pt -p "Hello" -n 32
+./bin/stream-pt -p "Hello world!" -n 64
 ```
 
-| Option | Default | Purpose |
-| --- | --- | --- |
-| `-prompt`, `-p` | `Hallo, sag nur Ja!` | User prompt; positional text is also accepted. |
-| `-max-tokens`, `-n` | `5` | Maximum number of generated tokens; nonpositive values select 64. |
-| `-threads`, `-t` | `GOMAXPROCS` | Compute worker count. |
-| `-window-mb`, `-w` | `64` | Streaming weight window in MiB; zero selects the engine default of 8 MiB. |
-| `-temp` | `0.8` | Sampling temperature; zero selects deterministic decoding after penalties. |
-| `-top-k` | `40` | Candidate limit; zero disables. |
-| `-top-p` | `0.95` | Nucleus probability threshold; one disables. |
-| `-min-p` | `0.05` | Minimum probability relative to the best candidate; zero disables. |
-| `-repeat-penalty` | `1.1` | Sign-aware repetition penalty; one disables. |
-| `-repeat-last-n` | `64` | Recent prompt and generated tokens to penalize; zero disables, -1 uses all history. |
-| `-frequency-penalty` | `0` | Subtracted per occurrence of a repeated token. |
-| `-presence-penalty` | `0` | Subtracted once for a previously seen token. |
-| `-seed` | random | Optional unsigned integer seed for reproducible Stream-PT sampling. |
-| `-expert-cache-mb` | `0` | Locked hot-expert cache budget in MiB; zero disables retention. |
-| `-expert-cache-min-uses` | `8` | Uses required before an expert matrix enters the cache. |
-| `-expert-stats` | `false` | Print expert-selection and cache statistics. |
-| `-no-expert-lookahead` | `false` | Disable prefetching of the next selected expert run. |
+---
 
-Use `GOEXPERIMENT=simd go run . -h` for command-line help. Keep the prompt and
-generation within the KV-cache capacity. Memory mapping still requires physical
-RAM for accessed weight pages; performance depends on CPU, RAM and storage.
+## ⚙️ CLI Flags & Configuration
 
-Sampling follows llama.cpp's active default chain: penalties, top-k, top-p,
-min-p, temperature, then a random draw from the normalized probabilities. Unlike
-current llama.cpp defaults (repeat penalty 1.0), Stream-PT enables a modest 1.1
-repeat penalty to reduce loops. Use `-repeat-penalty 1` for neutral penalties or
-`-temp 0 -repeat-penalty 1` for legacy greedy decoding. Seeds are reproducible
-within Stream-PT, not token-for-token equivalent to llama.cpp's random generator.
-Only the vocabulary logits/candidates are retained; model weights remain streamed.
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `-addr`, `-a` | `:8080` | HTTP listen address for the web server. |
+| `-prompt`, `-p` | `""` | Input prompt (switches to CLI mode when provided). |
+| `-max-tokens`, `-n` | `512` | Maximum number of new tokens to generate. |
+| `-threads`, `-t` | `GOMAXPROCS` | Number of worker goroutines / compute threads. |
+| `-window-mb`, `-w` | `64` | Streaming mmap chunk window size in MiB. |
+| `-temp` | `0.8` | Sampling temperature (`0` selects deterministic / greedy). |
+| `-top-k` | `40` | Top-K candidate limit (`0` disables). |
+| `-top-p` | `0.95` | Nucleus probability threshold (`1` disables). |
+| `-min-p` | `0.05` | Minimum relative probability threshold (`0` disables). |
+| `-repeat-penalty` | `1.0` | Repetition penalty (`1` disables). |
+| `-repeat-last-n` | `64` | Token context window length to penalize. |
+| `-frequency-penalty` | `0.0` | Penalty subtracted per occurrence of repeated token. |
+| `-presence-penalty` | `0.0` | Penalty applied for any previously seen token. |
+| `-seed` | `""` (random) | Unsigned integer seed for deterministic sampling. |
+| `-expert-cache-mb` | `0` | Budget in MiB to lock hot MoE expert weights in RAM (`0` disables). |
+| `-expert-cache-min-uses`| `8` | Frequency threshold before caching an expert matrix. |
+| `-expert-stats` | `false` | Log frequency statistics and cache hit ratios for expert matrices. |
+| `-no-expert-lookahead` | `false` | Disable background prefetch of next selected expert weights. |
 
-Without a prompt, the web server runs on `:8080`. Its settings include Temperature
-and repetition penalty, saved in browser local storage. CLI sampling flags set
-server defaults, exposed as `default_sampling` by `/api/info`. `/api/chat` accepts
-optional `temperature`, `top_k`, `top_p`, `min_p`, `repeat_penalty`, `repeat_last_n`,
-`frequency_penalty`, `presence_penalty`, and `seed` fields. Omitted fields use server
-defaults; explicit zero values are preserved where supported. Invalid parameters
-return HTTP 400 before streaming. Each request has its own sampling history/RNG.
-Low-level `ForwardToken` and `Prefill` remain greedy; `Generate` uses configured
-defaults, and `GenerateWithSampling` accepts explicit per-generation parameters.
+---
+
+## 🐛 Known Issues & Limitations
+
+- **Ellipsis Sentence Abbreviation Bug**: The model occasionally cuts off output or abbreviates thoughts mid-sentence with `(...)`. This is an identified issue within the forward/tokenizer handling that is actively being debugged and worked on.
+- **Fixed KV-Cache Window**: The internal KV cache currently supports a maximum sequence length of 2,048 tokens.
+- **Storage Dependency**: Inference throughput is directly correlated with storage read throughput and random I/O latency. Fast NVMe drives significantly outperform standard SATA SSDs.
+
+---
+
+## 🔬 Architecture: How it Works
+
+```
+                +------------------------------------+
+                |  GPT-OSS-120B GGUF Shards on SSD   |
+                +------------------------------------+
+                                  |
+                                  | mmap sliding windows (e.g. 64 MiB)
+                                  v
+                +------------------------------------+
+                |   File-Backed Memory Mapping       |
+                |   (ggufmap / OS Page Cache)        |
+                +------------------------------------+
+                                  |
+                   +--------------+---------------+
+                   |                              |
+                   v                              v
+      +-----------------------+      +-------------------------+
+      |  Hot Expert RAM Cache |      |  Lookahead / Prefetch   |
+      +-----------------------+      +-------------------------+
+                   |                              |
+                   +--------------+---------------+
+                                  |
+                                  v
+                +------------------------------------+
+                |  CPU Vectorized Compute            |
+                |  (Go experimental SIMD routines)   |
+                +------------------------------------+
+                                  |
+                                  v
+                +------------------------------------+
+                |  Token Stream & SSE Web Output     |
+                +------------------------------------+
+```
+
+1. **Zero-Copy Memory-Mapped Weights**: The GGUF index registers byte-offset spans for every tensor. Weights are accessed through mapped address space without allocating large Go heap buffers.
+2. **MoE Expert Streaming & Prefetch**: For Mixture-of-Experts layers, only the routed experts for each token are pulled into the working set. The lookahead engine prefetches upcoming matrices while earlier computations run.
+3. **Go SIMD Acceleration**: Layer computations (RMSNorm, Q4_0 / Q8_0 dot products, Attention) utilize Go's experimental SIMD intrinsics to optimize hardware instruction throughput across available CPU cores.
+
+---
+
+## 🤝 Contributing & Community
+
+Contributions, optimizations, and bug fixes are welcome! As this project is in an experimental phase, please feel free to open issues or pull requests discussing architecture enhancements, SIMD optimizations, or tokenizer fixes.
