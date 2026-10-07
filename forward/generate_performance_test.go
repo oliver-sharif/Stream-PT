@@ -41,7 +41,7 @@ func TestGenerateModelPerformance(t *testing.T) {
 	limit := integer("STREAM_PT_PERF_TOKENS", 5)
 	prompt := os.Getenv("STREAM_PT_PERF_PROMPT")
 	if prompt == "" {
-		prompt = "Hallo, sag nur Ja!"
+		prompt = "Hello, just say Yes!"
 	}
 	old := runtime.GOMAXPROCS(workers)
 	defer runtime.GOMAXPROCS(old)

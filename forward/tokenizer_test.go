@@ -43,8 +43,8 @@ func TestTokenizerInspection(t *testing.T) {
 	t.Logf("Loaded %d tokens", len(tok.Tokens))
 
 	testCases := []string{
-		"Hallo, sag nur Ja!",
-		"Guten Tag! Wie geht es dir?\nSehr gut, danke.",
+		"Hello, just say Yes!",
+		"Good day! How are you?\nVery well, thank you.",
 		"Special: äöüß € 123 \t \r\n",
 	}
 

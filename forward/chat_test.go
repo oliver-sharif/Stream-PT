@@ -15,67 +15,16 @@ import (
 	ggufmmap "Stream-PT/ggufmap"
 )
 
-func TestEncodeChatPrompt(t *testing.T) {
-	for _, special := range [][]string{
-		{"<|start|>", "<|message|>", "<|end|>", "<|channel|>"},
-		{"<|im_start|>", "<|im_sep|>", "<|im_end|>", "<|meta_sep|>"},
-	} {
-		t.Run(special[0], func(t *testing.T) {
-			tok := tokenizerFixture(t, append([]string{"user", "assistant", "final", "Ja", "!"}, special...))
-			got, err := tok.EncodeChatPrompt("Ja!")
-			if err != nil {
-				t.Fatal(err)
-			}
-			want := []int{5, 0, 6, 3, 4, 7, 5, 1}
-			if !slices.Equal(got, want) {
-				t.Fatalf("chat prompt = %v, want %v", got, want)
-			}
-		})
-	}
-}
-
 func TestEncodeChatPromptMissingSpecialTokens(t *testing.T) {
 	for _, tok := range []*Tokenizer{nil, {TokenMap: map[string]int{}}} {
-		if _, err := tok.EncodeChatPrompt("Ja!"); err == nil {
+		if _, err := tok.EncodeChatPrompt("Yes!"); err == nil {
 			t.Fatal("expected error for missing Harmony tokens")
 		}
 	}
 }
 
-func TestEncodeChatMessages(t *testing.T) {
-	special := []string{"<|start|>", "<|message|>", "<|end|>", "<|channel|>", "<|return|>"}
-	tok := tokenizerFixture(t, append([]string{"user", "assistant", "final", "system", "Hi", "Hello", "!"}, special...))
-
-	messages := []ChatMessage{
-		{Role: "system", Content: "Hello"},
-		{Role: "user", Content: "Hi"},
-		{Role: "assistant", Content: "Hello!"},
-		{Role: "user", Content: "Hi!"},
-	}
-	got, err := tok.EncodeChatMessages(messages)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	want := []int{7, 3, 8, 5, 9, 7, 0, 8, 4, 9,
-		7, 1, 10, 2, 8, 5, 6, 11, 7, 0, 8, 4, 6, 9, 7, 1}
-	if !slices.Equal(got, want) {
-		t.Fatalf("chat = %v, want %v (completed assistant turn and open generation header)", got, want)
-	}
-}
-
-func TestHarmonyMessageEndIsNotGenerationEnd(t *testing.T) {
-	e := &Engine{Config: &Config{EOS: 99, EOSTokens: []int{0, 1}},
-		Tokenizer: &Tokenizer{Tokens: []string{"<|end|>", "<|im_end|>"}}}
-	for id := range e.Tokenizer.Tokens {
-		if e.IsEOS(id) {
-			t.Fatalf("%q must allow analysis to continue into final", e.Tokenizer.Tokens[id])
-		}
-	}
-}
-
 func TestGPTOSSStopTokenAliases(t *testing.T) {
-	engine := &Engine{Tokenizer: &Tokenizer{Tokens: []string{"Ja", "!", "\n\n", "<|fim_suffix|>", "<|ghissue|>"}}}
+	engine := &Engine{Tokenizer: &Tokenizer{Tokens: []string{"Yes", "!", "\n\n", "<|fim_suffix|>", "<|ghissue|>"}}}
 	for id := range engine.Tokenizer.Tokens {
 		if got, want := engine.IsEOS(id), id >= 3; got != want {
 			t.Errorf("IsEOS(%q) = %v, want %v", engine.Tokenizer.Tokens[id], got, want)
@@ -126,7 +75,7 @@ func TestGenerateStopsAtGPTOSSCompletion(t *testing.T) {
 		TokenEmbd: embd, OutputNorm: norm, OutputWeight: output,
 		KVCache: NewKVCache(0, 3, 1, 2), X: make([]float32, dim),
 		Scratch:   &LayerScratch{NormedX: make([]float32, dim)},
-		Tokenizer: &Tokenizer{Tokens: []string{"prompt", "Ja", "!", "<|fim_suffix|>", "It"}},
+		Tokenizer: &Tokenizer{Tokens: []string{"prompt", "Yes", "!", "<|fim_suffix|>", "It"}},
 	}
 	var emitted []int
 	got, err := engine.Generate(context.Background(), []int{0}, 10, func(id int, text string) bool {

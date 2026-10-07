@@ -54,9 +54,16 @@ Currently, Stream-PT has been developed, tested, and validated exclusively again
 
 ### 1. Prerequisites
 
-- **OS**: Linux (x86_64 or ARM64)
+- **OS**: Linux (x86_64 or ARM64) — *Currently only Linux is supported.*
 - **Go**: Go 1.27.1+ with experimental SIMD support
 - **Hardware**: Any modern multi-core CPU and an SSD with at least ~70 GB of free space.
+
+> **Reference Development Hardware**:
+> Stream-PT was specifically developed and tested on modest commodity hardware:
+> ```text
+> CPU: Intel(R) Core(TM) i7-4790T CPU @ 2.70GHz
+> RAM: 15.5 GiB
+> ```
 
 ### 2. Download the Model
 
@@ -129,6 +136,7 @@ GOEXPERIMENT=simd go build -o bin/stream-pt .
 
 ## 🐛 Known Issues & Limitations
 
+- **Linux-Only Support**: Stream-PT currently runs exclusively on Linux (x86_64 / ARM64). Support for macOS and Windows is not yet available.
 - **Ellipsis Sentence Abbreviation Bug**: The model occasionally cuts off output or abbreviates thoughts mid-sentence with `(...)`. This is an identified issue within the forward/tokenizer handling that is actively being debugged and worked on.
 - **Fixed KV-Cache Window**: The internal KV cache currently supports a maximum sequence length of 2,048 tokens.
 - **Storage Dependency**: Inference throughput is directly correlated with storage read throughput and random I/O latency. Fast NVMe drives significantly outperform standard SATA SSDs.

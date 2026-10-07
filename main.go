@@ -670,9 +670,9 @@ const indexHTML = `<!DOCTYPE html>
       <span class="badge">SSE Live</span>
     </div>
     <div class="header-actions">
-      <span id="status-text" class="status-text">Bereit</span>
-      <button id="settings-btn" class="btn-secondary" title="Parameter & Einstellungen">⚙ Einstellungen</button>
-      <button id="clear-btn" class="btn-secondary" title="Konversation und Kontext leeren">Neuer Chat</button>
+      <span id="status-text" class="status-text">Ready</span>
+      <button id="settings-btn" class="btn-secondary" title="Parameters & Settings">⚙ Settings</button>
+      <button id="clear-btn" class="btn-secondary" title="Clear conversation and context">New Chat</button>
     </div>
   </header>
 
@@ -680,20 +680,20 @@ const indexHTML = `<!DOCTYPE html>
     <div id="chat-container">
       <div class="message assistant">
         <div class="message-role">Stream-PT</div>
-        <div class="bubble">Hallo! Wie kann ich Ihnen heute helfen?</div>
+        <div class="bubble">Hello! How can I help you today?</div>
       </div>
     </div>
 
     <div class="input-section">
       <div class="input-row">
-        <textarea id="prompt-input" rows="1" placeholder="Nachricht eingeben... (Enter zum Senden, Shift+Enter für Zeilenumbruch)"></textarea>
-        <button id="stop-btn" class="btn-danger" style="display: none;">Stopp</button>
-        <button id="send-btn" class="btn-primary">Senden</button>
+        <textarea id="prompt-input" rows="1" placeholder="Type a message... (Enter to send, Shift+Enter for newline)"></textarea>
+        <button id="stop-btn" class="btn-danger" style="display: none;">Stop</button>
+        <button id="send-btn" class="btn-primary">Send</button>
       </div>
       <div class="input-footer">
         <div class="input-footer-left">
-          <span>Kontext im Browser</span>
-          <span id="footer-settings-badge" class="settings-pill" title="Klicken, um Einstellungen anzupassen">⚙ Max Tokens: <span id="footer-max-tokens">512</span></span>
+          <span>Browser Context</span>
+          <span id="footer-settings-badge" class="settings-pill" title="Click to adjust settings">⚙ Max Tokens: <span id="footer-max-tokens">512</span></span>
         </div>
         <span id="token-counter"></span>
       </div>
@@ -704,8 +704,8 @@ const indexHTML = `<!DOCTYPE html>
   <div id="settings-modal" class="modal-backdrop" style="display: none;">
     <div class="modal-card">
       <div class="modal-header">
-        <h2>⚙ Einstellungen & Parameter</h2>
-        <button id="close-settings-btn" class="btn-icon" title="Schließen">&times;</button>
+        <h2>⚙ Settings & Parameters</h2>
+        <button id="close-settings-btn" class="btn-icon" title="Close">&times;</button>
       </div>
       <div class="modal-body">
         <div class="setting-group">
@@ -725,7 +725,7 @@ const indexHTML = `<!DOCTYPE html>
             <button type="button" class="preset-btn" data-val="1024">1024</button>
             <button type="button" class="preset-btn" data-val="2048">2048</button>
           </div>
-          <p class="setting-help">Maximale Anzahl der zu generierenden Tokens pro Antwort.</p>
+          <p class="setting-help">Maximum number of tokens to generate per response.</p>
         </div>
 
         <div class="setting-group">
@@ -737,32 +737,32 @@ const indexHTML = `<!DOCTYPE html>
             <input type="range" id="temperature-slider" min="0" max="2" step="0.01" value="0.8">
             <input type="number" id="temperature-input" min="0" max="2" step="0.01" value="0.8">
           </div>
-          <p class="setting-help">0 = deterministische Auswahl mit Wiederholungsstrafe. Höhere Werte erzeugen vielfältigere Antworten; Standard: 0,8.</p>
+          <p class="setting-help">0 = deterministic greedy selection. Higher values produce more diverse responses; default: 0.80.</p>
         </div>
 
         <div class="setting-group">
           <div class="setting-header">
-            <label for="repeat-penalty-input">Wiederholungsstrafe</label>
+            <label for="repeat-penalty-input">Repetition Penalty</label>
             <input type="number" id="repeat-penalty-input" min="1" max="2" step="0.01" value="1">
           </div>
-          <p class="setting-help">Standard: 1 (deaktiviert, wie llama.cpp). Höhere Werte bestrafen die letzten 64 Kontext- und Antwort-Tokens und können Code und Formatierung beschädigen. Sampling: Top-k 40, Top-p 0,95, Min-p 0,05 (Server-Standardwerte).</p>
+          <p class="setting-help">Default: 1 (disabled, matching llama.cpp). Higher values penalize the last 64 context and generated tokens. Sampling defaults: Top-k 40, Top-p 0.95, Min-p 0.05.</p>
         </div>
 
         <div class="setting-group">
           <div class="setting-header">
-            <label for="system-prompt-input">System-Prompt (Rolle / Anweisung)</label>
+            <label for="system-prompt-input">System Prompt (Role / Instructions)</label>
           </div>
-          <textarea id="system-prompt-input" class="form-textarea" rows="2" placeholder="z. B. Du bist ein präziser, deutschsprachiger KI-Assistent..."></textarea>
-          <p class="setting-help">Optionaler System-Prompt zur Steuerung des Modellverhaltens.</p>
+          <textarea id="system-prompt-input" class="form-textarea" rows="2" placeholder="e.g. You are a helpful AI assistant..."></textarea>
+          <p class="setting-help">Optional system prompt to guide model behavior.</p>
         </div>
 
         <div class="setting-group">
           <div class="setting-header">
-            <span>System & Modell-Info</span>
+            <span>System & Model Info</span>
           </div>
           <div class="info-grid">
-            <div class="info-item"><span class="info-label">Modell</span><span id="info-model" class="info-val">-</span></div>
-            <div class="info-item"><span class="info-label">Layer</span><span id="info-layers" class="info-val">-</span></div>
+            <div class="info-item"><span class="info-label">Model</span><span id="info-model" class="info-val">-</span></div>
+            <div class="info-item"><span class="info-label">Layers</span><span id="info-layers" class="info-val">-</span></div>
             <div class="info-item"><span class="info-label">Workers (Threads)</span><span id="info-workers" class="info-val">-</span></div>
             <div class="info-item"><span class="info-label">Chunk Window</span><span id="info-window" class="info-val">-</span></div>
             <div class="info-item"><span class="info-label">CPU</span><span id="info-cpu" class="info-val">-</span></div>
@@ -771,8 +771,8 @@ const indexHTML = `<!DOCTYPE html>
         </div>
       </div>
       <div class="modal-footer">
-        <button id="reset-settings-btn" class="btn-secondary">Standard</button>
-        <button id="save-settings-btn" class="btn-primary">Fertig</button>
+        <button id="reset-settings-btn" class="btn-secondary">Reset</button>
+        <button id="save-settings-btn" class="btn-primary">Done</button>
       </div>
     </div>
   </div>
@@ -974,9 +974,9 @@ const indexHTML = `<!DOCTYPE html>
     function updateStatus() {
       const turns = messages.filter(m => m.role === 'user').length;
       if (turns === 0) {
-        statusText.textContent = 'Bereit';
+        statusText.textContent = 'Ready';
       } else {
-        statusText.textContent = turns + (turns === 1 ? ' Nachricht im Kontext' : ' Nachrichten im Kontext');
+        statusText.textContent = turns + (turns === 1 ? ' message in context' : ' messages in context');
       }
     }
 
@@ -987,7 +987,7 @@ const indexHTML = `<!DOCTYPE html>
       messages = [];
       chatContainer.innerHTML = '';
       tokenCounter.textContent = '';
-      appendMessageBubble('assistant', 'Stream-PT', 'Neuer Chat gestartet. Wie kann ich helfen?');
+      appendMessageBubble('assistant', 'Stream-PT', 'New chat started. How can I help?');
       updateStatus();
     });
 
@@ -1038,7 +1038,7 @@ const indexHTML = `<!DOCTYPE html>
       promptInput.style.height = 'auto';
 
       messages.push({ role: 'user', content: text });
-      appendMessageBubble('user', 'Sie', text);
+      appendMessageBubble('user', 'You', text);
       updateStatus();
 
       const assistantBubble = appendMessageBubble('assistant', 'Stream-PT', '');
@@ -1054,7 +1054,7 @@ const indexHTML = `<!DOCTYPE html>
       let fullResponse = '';
       let generatedTokens = 0;
       const startTime = performance.now();
-      tokenCounter.textContent = 'Generiere (max ' + settings.maxTokens + ' Tokens)...';
+      tokenCounter.textContent = 'Generating (max ' + settings.maxTokens + ' tokens)...';
 
       const outgoingMessages = [];
       if (settings.systemPrompt && settings.systemPrompt.trim()) {
@@ -1100,7 +1100,7 @@ const indexHTML = `<!DOCTYPE html>
             try {
               const event = JSON.parse(payload);
               if (event.error) {
-                fullResponse += '\n[Fehler: ' + event.error + ']';
+                fullResponse += '\n[Error: ' + event.error + ']';
                 assistantBubble.textContent = fullResponse;
                 assistantBubble.appendChild(cursor);
               } else if (event.text !== undefined) {
@@ -1111,7 +1111,7 @@ const indexHTML = `<!DOCTYPE html>
                 chatContainer.scrollTop = chatContainer.scrollHeight;
                 const elapsedSec = (performance.now() - startTime) / 1000;
                 const speed = elapsedSec > 0 ? (generatedTokens / elapsedSec).toFixed(1) : '0';
-                tokenCounter.textContent = generatedTokens + ' / ' + settings.maxTokens + ' Tokens (' + speed + ' T/s)';
+                tokenCounter.textContent = generatedTokens + ' / ' + settings.maxTokens + ' tokens (' + speed + ' T/s)';
               }
               if (event.done) {
                 break;
@@ -1127,14 +1127,14 @@ const indexHTML = `<!DOCTYPE html>
           messages.push({ role: 'assistant', content: fullResponse });
         }
         const totalElapsed = ((performance.now() - startTime) / 1000).toFixed(1);
-        tokenCounter.textContent = generatedTokens + ' Tokens generiert in ' + totalElapsed + 's';
+        tokenCounter.textContent = generatedTokens + ' tokens generated in ' + totalElapsed + 's';
       } catch (err) {
         cursor.remove();
         if (err.name !== 'AbortError') {
-          assistantBubble.textContent += '\n[Fehler: ' + err.message + ']';
+          assistantBubble.textContent += '\n[Error: ' + err.message + ']';
         } else if (fullResponse) {
           messages.push({ role: 'assistant', content: fullResponse });
-          tokenCounter.textContent = 'Gestoppt bei ' + generatedTokens + ' Tokens';
+          tokenCounter.textContent = 'Stopped at ' + generatedTokens + ' tokens';
         }
       } finally {
         isGenerating = false;
@@ -1231,14 +1231,14 @@ func main() {
 	}
 
 	fmt.Println("╭────────────────────────────────────────────────────────────╮")
-	fmt.Println("│                    SYSTEM & MODELL                         │")
+	fmt.Println("│                    SYSTEM & MODEL                          │")
 	fmt.Println("├────────────────────────────────────────────────────────────┤")
 	fmt.Printf("│ CPU:    %-51s │\n", cpuModel())
 	fmt.Printf("│ RAM:    %-51s │\n", totalRAM())
-	fmt.Printf("│ Modell: %-51s │\n", modelDescription(paths))
-	fmt.Printf("│ Layer:  %-51d │\n", model.LayerCount)
+	fmt.Printf("│ Model:  %-51s │\n", modelDescription(paths))
+	fmt.Printf("│ Layers: %-51d │\n", model.LayerCount)
 	fmt.Println("╰────────────────────────────────────────────────────────────╯")
-	fmt.Printf("Gewichte aus %d Dateien bleiben dateibasiert geladen.\n", len(model.Paths))
+	fmt.Printf("Weights from %d files remain file-backed via memory mapping.\n", len(model.Paths))
 
 	threads := *threadsFlag
 	if threads <= 0 {
@@ -1287,14 +1287,14 @@ func main() {
 	}
 
 	addr := *addrFlag
-	fmt.Printf("\n--- Stream-PT Chat Server gestartet ---\n")
-	fmt.Printf("Adresse:           http://localhost%s\n", formatAddr(addr))
+	fmt.Printf("\n--- Stream-PT Chat Server Started ---\n")
+	fmt.Printf("Address:           http://localhost%s\n", formatAddr(addr))
 	fmt.Printf("Workers (Threads): %d\n", engine.Options.Workers)
 	fmt.Printf("Chunk Window:      %d MiB\n", engine.Options.WindowBytes/(1024*1024))
-	fmt.Printf("Bereit für Browser-Verbindungen...\n\n")
+	fmt.Printf("Ready for browser connections...\n\n")
 
 	if err := http.ListenAndServe(addr, server.routes()); err != nil {
-		log.Fatalf("HTTP-Server Fehler: %v", err)
+		log.Fatalf("HTTP server error: %v", err)
 	}
 }
 
@@ -1331,7 +1331,7 @@ func runCLI(engine *forward.Engine, reader *ggufmmap.Reader, prompt string, maxT
 		fmt.Printf("[Token %d: %q]\n", tokenID, text)
 		return true
 	})
-	fmt.Printf("Inferenzzeit: %s\n", time.Since(inferenceStart).Round(time.Millisecond))
+	fmt.Printf("Inference time: %s\n", time.Since(inferenceStart).Round(time.Millisecond))
 	if expertStats || hasCache {
 		stats := reader.ExpertCacheStats()
 		fmt.Printf("Expert weights: %d selected ranges, %.2f MiB; %d mapped runs; %d cache hits; %.2f MiB locked; %d lock failures\n",
@@ -1379,7 +1379,7 @@ func cpuModel() string {
 func totalRAM() string {
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
-		return "Unbekannt"
+		return "Unknown"
 	}
 
 	for _, line := range strings.Split(string(data), "\n") {
@@ -1391,12 +1391,12 @@ func totalRAM() string {
 			}
 		}
 	}
-	return "Unbekannt"
+	return "Unknown"
 }
 
 func modelDescription(paths []string) string {
 	if len(paths) == 0 {
-		return "Unbekannt"
+		return "Unknown"
 	}
 
 	name := strings.TrimSuffix(filepath.Base(paths[0]), ".gguf")
@@ -1406,7 +1406,7 @@ func modelDescription(paths []string) string {
 		}
 	}
 	if len(paths) > 1 {
-		return fmt.Sprintf("%s (%d Dateien)", name, len(paths))
+		return fmt.Sprintf("%s (%d files)", name, len(paths))
 	}
 	return name
 }

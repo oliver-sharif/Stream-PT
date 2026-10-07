@@ -50,12 +50,12 @@ func TestConfigAndTokenizer(t *testing.T) {
 	if len(encoded) == 0 {
 		t.Fatalf("Encoding failed for 'hello'")
 	}
-	chat, err := tok.EncodeChatPrompt("Hallo, sag nur Ja!")
+	chat, err := tok.EncodeChatPrompt("Hello, just say Yes!")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("Chat prompt tokens: %v", chat)
-	if len(chat) <= len(tok.Encode("Hallo, sag nur Ja!")) {
+	if len(chat) <= len(tok.Encode("Hello, just say Yes!")) {
 		t.Fatal("chat prompt is missing the Harmony framing")
 	}
 }

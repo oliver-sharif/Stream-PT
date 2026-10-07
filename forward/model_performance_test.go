@@ -50,7 +50,7 @@ func TestModelPerformance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tokens, err := engine.Tokenizer.EncodeChatPrompt("Hallo, sag nur Ja!")
+	tokens, err := engine.Tokenizer.EncodeChatPrompt("Hello, just say Yes!")
 	if err != nil {
 		t.Fatal(err)
 	}
