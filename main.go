@@ -32,6 +32,7 @@ type ServerInfo struct {
 	DefaultSampling  forward.SamplingOptions `json:"default_sampling"`
 	CPU              string                  `json:"cpu"`
 	RAM              string                  `json:"ram"`
+	Cache            *CacheDiagnostics       `json:"cache,omitempty"`
 }
 
 type ChatServer struct {
@@ -42,6 +43,7 @@ type ChatServer struct {
 }
 
 type ChatRequest struct {
+	SessionID        string                `json:"session_id,omitempty"`
 	Messages         []forward.ChatMessage `json:"messages"`
 	Prompt           string                `json:"prompt"`
 	SystemPrompt     string                `json:"system_prompt,omitempty"`
@@ -96,10 +98,15 @@ func (r ChatRequest) samplingOptions(options forward.SamplingOptions) forward.Sa
 }
 
 type ChatEvent struct {
-	Token int    `json:"token,omitempty"`
-	Text  string `json:"text,omitempty"`
-	Done  bool   `json:"done,omitempty"`
-	Error string `json:"error,omitempty"`
+	Token           int                   `json:"token,omitempty"`
+	Text            string                `json:"text,omitempty"`
+	Reasoning       string                `json:"reasoning,omitempty"`
+	Done            bool                  `json:"done,omitempty"`
+	Error           string                `json:"error,omitempty"`
+	FinishReason    string                `json:"finish_reason,omitempty"`
+	StopToken       *int                  `json:"stop_token,omitempty"`
+	GeneratedTokens int                   `json:"generated_tokens,omitempty"`
+	Performance     *InferencePerformance `json:"performance,omitempty"`
 }
 
 func (s *ChatServer) routes() http.Handler {
@@ -133,6 +140,10 @@ func (s *ChatServer) handleInfo(w http.ResponseWriter, r *http.Request) {
 		info.DefaultMaxTokens = 512
 	}
 	if s.Engine != nil {
+		if s.Engine.Reader != nil {
+			cache := cacheDiagnostics(s.Engine.Reader.ExpertCacheStats())
+			info.Cache = &cache
+		}
 		if s.Engine.Config != nil && info.LayerCount == 0 {
 			info.LayerCount = s.Engine.Config.NumLayers
 		}
@@ -162,6 +173,10 @@ func (s *ChatServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid JSON request: %v", err), http.StatusBadRequest)
+		return
+	}
+	if len(req.SessionID) > 128 {
+		http.Error(w, "session_id exceeds 128 bytes", http.StatusBadRequest)
 		return
 	}
 	sampling := req.samplingOptions(s.samplingDefaults())
@@ -226,26 +241,41 @@ func (s *ChatServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	_, err = s.Engine.GenerateWithSampling(ctx, promptTokens, maxTokens, sampling, func(tokenID int, text string) bool {
+	stream := forward.NewHarmonyStream(s.Engine.Tokenizer)
+	generatedTokens := 0
+	ioBefore := readProcessIO()
+	cacheBefore := s.Engine.Reader.ExpertCacheStats()
+	var firstVisibleSeconds float64
+	started := time.Now()
+	result, err := s.Engine.GenerateWithSessionResult(ctx, req.SessionID, promptTokens, maxTokens, sampling, func(tokenID int, text string) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		if err := sendSSE(ChatEvent{Token: tokenID, Text: text}); err != nil {
+		text, reasoning := stream.PushWithReasoning(tokenID, text)
+		if text != "" && firstVisibleSeconds == 0 {
+			firstVisibleSeconds = time.Since(started).Seconds()
+		}
+		generatedTokens++
+		if err := sendSSE(ChatEvent{Token: tokenID, Text: text, Reasoning: reasoning, GeneratedTokens: generatedTokens}); err != nil {
 			return false
 		}
 		return true
 	})
+	performance := inferencePerformance(result.Metrics, firstVisibleSeconds, ioBefore, readProcessIO())
+	performance.Cache = cacheDiagnostics(s.Engine.Reader.ExpertCacheStats())
+	performance.CacheHits = performance.Cache.ExpertHits - cacheBefore.CacheHits
+	performance.ResidentHits = performance.Cache.ResidentHits - cacheBefore.ResidentHits
 
 	if err != nil && ctx.Err() == nil {
-		_ = sendSSE(ChatEvent{Error: err.Error(), Done: true})
+		_ = sendSSE(ChatEvent{Error: err.Error(), Done: true, FinishReason: result.FinishReason, GeneratedTokens: len(result.Tokens), Performance: &performance})
 		return
 	}
 
-	_ = sendSSE(ChatEvent{Done: true})
+	_ = sendSSE(ChatEvent{Done: true, FinishReason: result.FinishReason, StopToken: result.StopToken, GeneratedTokens: len(result.Tokens), Performance: &performance})
 }
 
 const indexHTML = `<!DOCTYPE html>
-<html lang="de">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -435,6 +465,23 @@ const indexHTML = `<!DOCTYPE html>
       margin-left: 2px;
       vertical-align: middle;
       animation: blink 0.8s infinite;
+    }
+    .reasoning {
+      width: 80%;
+      margin-bottom: 8px;
+      padding: 10px 14px;
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      color: var(--text-muted);
+      box-sizing: border-box;
+    }
+    .reasoning summary { cursor: pointer; }
+    .reasoning-content {
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin-top: 8px;
+      font-size: 0.9rem;
+      line-height: 1.5;
     }
     @keyframes blink {
       0%, 50% { opacity: 1; }
@@ -767,6 +814,7 @@ const indexHTML = `<!DOCTYPE html>
             <div class="info-item"><span class="info-label">Chunk Window</span><span id="info-window" class="info-val">-</span></div>
             <div class="info-item"><span class="info-label">CPU</span><span id="info-cpu" class="info-val">-</span></div>
             <div class="info-item"><span class="info-label">RAM</span><span id="info-ram" class="info-val">-</span></div>
+            <div class="info-item"><span class="info-label">Weight cache</span><span id="info-cache" class="info-val">-</span></div>
           </div>
         </div>
       </div>
@@ -965,10 +1013,15 @@ const indexHTML = `<!DOCTYPE html>
           if (info.window_mb) document.getElementById('info-window').textContent = info.window_mb + ' MiB';
           if (info.cpu) document.getElementById('info-cpu').textContent = info.cpu;
           if (info.ram) document.getElementById('info-ram').textContent = info.ram;
+          if (info.cache) updateCacheInfo(info.cache);
         }
       } catch (e) {
         console.warn('Could not fetch /api/info:', e);
       }
+    }
+
+    function updateCacheInfo(cache) {
+      document.getElementById('info-cache').textContent = (cache.retained_bytes / 1048576).toFixed(0) + ' / ' + (cache.budget_bytes / 1048576).toFixed(0) + ' MiB · pinned ' + (cache.pinned_bytes / 1048576).toFixed(0) + ' MiB · ' + cache.evictions + ' evictions';
     }
 
     function updateStatus() {
@@ -1030,6 +1083,8 @@ const indexHTML = `<!DOCTYPE html>
       return bubbleDiv;
     }
 
+    const inferenceSessionID = Array.from(crypto.getRandomValues(new Uint32Array(4)), n => n.toString(16).padStart(8, '0')).join('');
+
     async function sendMessage() {
       const text = promptInput.value.trim();
       if (!text || isGenerating) return;
@@ -1042,6 +1097,16 @@ const indexHTML = `<!DOCTYPE html>
       updateStatus();
 
       const assistantBubble = appendMessageBubble('assistant', 'Stream-PT', '');
+      const reasoningPanel = document.createElement('details');
+      reasoningPanel.className = 'reasoning';
+      reasoningPanel.open = true;
+      const reasoningSummary = document.createElement('summary');
+      reasoningSummary.textContent = 'Processing prompt …';
+      const reasoningContent = document.createElement('div');
+      reasoningContent.className = 'reasoning-content';
+      reasoningPanel.appendChild(reasoningSummary);
+      reasoningPanel.appendChild(reasoningContent);
+      assistantBubble.parentNode.insertBefore(reasoningPanel, assistantBubble);
       const cursor = document.createElement('span');
       cursor.className = 'cursor';
       assistantBubble.appendChild(cursor);
@@ -1052,9 +1117,16 @@ const indexHTML = `<!DOCTYPE html>
       abortController = new AbortController();
 
       let fullResponse = '';
+      let fullReasoning = '';
+      let finalPerformance = null;
       let generatedTokens = 0;
       const startTime = performance.now();
       tokenCounter.textContent = 'Generating (max ' + settings.maxTokens + ' tokens)...';
+      const progressTimer = setInterval(() => {
+        const elapsedSec = (performance.now() - startTime) / 1000;
+        const speed = elapsedSec > 0 ? (generatedTokens / elapsedSec).toFixed(1) : '0';
+        tokenCounter.textContent = generatedTokens + ' / ' + settings.maxTokens + ' tokens (' + speed + ' T/s, ' + elapsedSec.toFixed(1) + 's)';
+      }, 250);
 
       const outgoingMessages = [];
       if (settings.systemPrompt && settings.systemPrompt.trim()) {
@@ -1067,6 +1139,7 @@ const indexHTML = `<!DOCTYPE html>
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+			session_id: inferenceSessionID,
             messages: outgoingMessages,
             max_tokens: settings.maxTokens,
             temperature: settings.temperature,
@@ -1099,12 +1172,25 @@ const indexHTML = `<!DOCTYPE html>
             if (payload === '[DONE]') break;
             try {
               const event = JSON.parse(payload);
+              if (!event.done && !event.error) generatedTokens++;
+              if (event.generated_tokens !== undefined) generatedTokens = event.generated_tokens;
+              if (event.reasoning !== undefined) {
+                fullReasoning += event.reasoning;
+                reasoningContent.textContent = fullReasoning;
+                reasoningSummary.textContent = 'Thinking …';
+                statusText.textContent = 'Thinking …';
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+              } else if (!event.done && !event.error && !event.text && !fullResponse && !fullReasoning) {
+                reasoningSummary.textContent = 'Generation in progress …';
+                statusText.textContent = 'Generation in progress …';
+              }
               if (event.error) {
                 fullResponse += '\n[Error: ' + event.error + ']';
                 assistantBubble.textContent = fullResponse;
                 assistantBubble.appendChild(cursor);
               } else if (event.text !== undefined) {
-                generatedTokens++;
+                reasoningSummary.textContent = fullReasoning ? 'Thinking complete' : 'Generating answer …';
+                statusText.textContent = 'Generating answer …';
                 fullResponse += event.text;
                 assistantBubble.textContent = fullResponse;
                 assistantBubble.appendChild(cursor);
@@ -1114,6 +1200,19 @@ const indexHTML = `<!DOCTYPE html>
                 tokenCounter.textContent = generatedTokens + ' / ' + settings.maxTokens + ' tokens (' + speed + ' T/s)';
               }
               if (event.done) {
+                finalPerformance = event.performance || null;
+                clearInterval(progressTimer);
+                const notices = {
+                  length: 'Token limit reached; answer may be incomplete.',
+                  context_length: 'Context limit reached; answer may be incomplete.',
+                  tool_calls: 'Model requested a tool; tool execution is not supported.'
+                };
+                if (notices[event.finish_reason]) {
+                  const notice = document.createElement('div');
+                  notice.className = 'setting-help';
+                  notice.textContent = notices[event.finish_reason];
+                  assistantBubble.appendChild(notice);
+                }
                 break;
               }
             } catch (err) {
@@ -1128,15 +1227,24 @@ const indexHTML = `<!DOCTYPE html>
         }
         const totalElapsed = ((performance.now() - startTime) / 1000).toFixed(1);
         tokenCounter.textContent = generatedTokens + ' tokens generated in ' + totalElapsed + 's';
+        if (finalPerformance) {
+          const p = finalPerformance;
+          tokenCounter.textContent += ' · Decode ' + p.decode_tokens_per_second.toFixed(2) + ' T/s · Prompt ' + p.prefill_seconds.toFixed(2) + 's · KV ' + p.reused_prompt_tokens + '/' + p.prompt_tokens + ' reused';
+          if (p.io_available) tokenCounter.textContent += ' · SSD ' + (p.read_bytes / 1048576).toFixed(1) + ' MiB';
+          if (p.cache) updateCacheInfo(p.cache);
+        }
       } catch (err) {
         cursor.remove();
         if (err.name !== 'AbortError') {
           assistantBubble.textContent += '\n[Error: ' + err.message + ']';
-        } else if (fullResponse) {
-          messages.push({ role: 'assistant', content: fullResponse });
+        } else {
+          if (fullResponse) messages.push({ role: 'assistant', content: fullResponse });
           tokenCounter.textContent = 'Stopped at ' + generatedTokens + ' tokens';
         }
       } finally {
+        clearInterval(progressTimer);
+        reasoningSummary.textContent = fullReasoning ? (fullResponse ? 'Thinking' : 'Thinking ended – no final answer') : 'Processing complete';
+        if (fullResponse && !fullReasoning) reasoningPanel.remove();
         isGenerating = false;
         sendBtn.disabled = false;
         stopBtn.style.display = 'none';
@@ -1179,13 +1287,29 @@ func main() {
 
 	addrFlag := flag.String("addr", ":8080", "HTTP server address for the chat web server")
 	flag.StringVar(addrFlag, "a", ":8080", "HTTP server address (shorthand)")
+	modelDirFlag := flag.String("model-dir", "model", "Directory containing both GPT-OSS GGUF shards")
+	prefillBatchFlag := flag.Int("prefill-batch", forward.DefaultPrefillBatchSize, "Prompt positions per weight pass (1 selects token-wise prefill)")
 
-	expertCacheMBFlag := flag.Uint64("expert-cache-mb", 0, "Maximum locked hot-expert cache in MiB (0 disables retention)")
-	expertMinUsesFlag := flag.Uint64("expert-cache-min-uses", 8, "Expert matrix uses before hot-cache admission")
+	expertCacheMBFlag := flag.Uint64("expert-cache-mb", 2048, "Shared weight cache budget in MiB (default auto-capped for available memory; 0 disables)")
+	residentCacheMBFlag := flag.Uint64("resident-cache-mb", 1024, "Basis weight reservation in MiB (at most half the shared budget; 0 disables)")
+	expertMinUsesFlag := flag.Uint64("expert-cache-min-uses", 2, "Expert matrix uses before hot-cache admission")
+	lookaheadMBFlag := flag.Uint64("expert-lookahead-mb", 32, "Maximum expert lookahead mapping size in MiB")
+	lookaheadRunsFlag := flag.Int("expert-lookahead-runs", 1, "Selected expert runs to prepare ahead (1-8; no additional workers)")
+	prefetchMBFlag := flag.Uint64("prefetch-mb", 0, "Advice coverage per expert mapping in MiB (0 covers the complete selected mapping)")
+	noPrefetchFlag := flag.Bool("no-prefetch", false, "Disable MADV_WILLNEED hints for comparison")
 	expertStatsFlag := flag.Bool("expert-stats", false, "Track and report selected expert matrix frequencies")
 	noExpertLookaheadFlag := flag.Bool("no-expert-lookahead", false, "Disable prefetch of the next selected expert run (for comparison)")
 
 	flag.Parse()
+	cacheExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "expert-cache-mb" {
+			cacheExplicit = true
+		}
+	})
+	if !cacheExplicit {
+		*expertCacheMBFlag = automaticCacheMiB(*expertCacheMBFlag)
+	}
 	if *seedFlag != "" {
 		seed, err := strconv.ParseUint(*seedFlag, 10, 64)
 		if err != nil {
@@ -1196,13 +1320,16 @@ func main() {
 	if err := sampling.Validate(); err != nil {
 		log.Fatal(err)
 	}
-	if *expertCacheMBFlag > ^uint64(0)>>20 {
-		log.Fatal("expert-cache-mb exceeds supported size")
+	if *expertCacheMBFlag > ^uint64(0)>>20 || *residentCacheMBFlag > ^uint64(0)>>20 || *lookaheadMBFlag > ^uint64(0)>>20 || *prefetchMBFlag > ^uint64(0)>>20 {
+		log.Fatal("cache or prefetch budget exceeds supported size")
+	}
+	if *prefillBatchFlag <= 0 || *windowMBFlag < 0 {
+		log.Fatal("prefill-batch must be positive and window-mb must be nonnegative")
 	}
 
 	paths := []string{
-		"model/gpt-oss-120b-Q4_0-00001-of-00002.gguf",
-		"model/gpt-oss-120b-Q4_0-00002-of-00002.gguf",
+		filepath.Join(*modelDirFlag, "gpt-oss-120b-Q4_0-00001-of-00002.gguf"),
+		filepath.Join(*modelDirFlag, "gpt-oss-120b-Q4_0-00002-of-00002.gguf"),
 	}
 
 	model, err := ggufindex.Open(paths)
@@ -1223,12 +1350,20 @@ func main() {
 		log.Fatalf("Failed to configure expert lookahead: %v", err)
 	}
 	if err := reader.ConfigureExpertCache(ggufmmap.ExpertCacheOptions{
-		MaxBytes:   *expertCacheMBFlag << 20,
-		MinUses:    *expertMinUsesFlag,
-		TrackStats: *expertStatsFlag,
+		MaxBytes:        *expertCacheMBFlag << 20,
+		MinUses:         *expertMinUsesFlag,
+		TrackStats:      *expertStatsFlag,
+		LookaheadBytes:  *lookaheadMBFlag << 20,
+		LookaheadRuns:   *lookaheadRunsFlag,
+		PrefetchBytes:   *prefetchMBFlag << 20,
+		DisablePrefetch: *noPrefetchFlag,
 	}); err != nil {
 		log.Fatalf("Failed to configure expert cache: %v", err)
 	}
+	if err := reader.ConfigureResidentTensors(residentWeightCandidates(model), min(*expertCacheMBFlag<<19, *residentCacheMBFlag<<20)); err != nil {
+		log.Fatalf("Failed to configure resident weights: %v", err)
+	}
+	fmt.Printf("Shared weight cache budget: %d MiB (best-effort memory locking).\n", *expertCacheMBFlag)
 
 	fmt.Println("╭────────────────────────────────────────────────────────────╮")
 	fmt.Println("│                    SYSTEM & MODEL                          │")
@@ -1252,9 +1387,10 @@ func main() {
 	}
 
 	engineOpts := forward.EngineOptions{
-		Workers:     threads,
-		WindowBytes: windowBytes,
-		Sampling:    &sampling,
+		Workers:          threads,
+		WindowBytes:      windowBytes,
+		PrefillBatchSize: *prefillBatchFlag,
+		Sampling:         &sampling,
 	}
 
 	engine, err := forward.NewEngineWithOptions(model, reader, engineOpts)
@@ -1327,16 +1463,56 @@ func runCLI(engine *forward.Engine, reader *ggufmmap.Reader, prompt string, maxT
 	ctx := context.Background()
 	fmt.Printf("\nGenerating tokens (streaming layer-by-layer):\n")
 	inferenceStart := time.Now()
-	_, err = engine.Generate(ctx, promptTokens, maxTokens, func(tokenID int, text string) bool {
-		fmt.Printf("[Token %d: %q]\n", tokenID, text)
+	stream := forward.NewHarmonyStream(engine.Tokenizer)
+	options := forward.DefaultSamplingOptions()
+	if engine.Options.Sampling != nil {
+		options = *engine.Options.Sampling
+	}
+	outputPhase := ""
+	ioBefore := readProcessIO()
+	cacheBefore := reader.ExpertCacheStats()
+	var firstVisibleSeconds float64
+	result, err := engine.GenerateWithSamplingResult(ctx, promptTokens, maxTokens, options, func(tokenID int, text string) bool {
+		answer, reasoning := stream.PushWithReasoning(tokenID, text)
+		if answer != "" && firstVisibleSeconds == 0 {
+			firstVisibleSeconds = time.Since(inferenceStart).Seconds()
+		}
+		if reasoning != "" {
+			if outputPhase != "analysis" {
+				fmt.Print("\n[Thinking]\n")
+				outputPhase = "analysis"
+			}
+			fmt.Print(reasoning)
+		}
+		if answer != "" {
+			if outputPhase != "final" {
+				fmt.Print("\n[Answer]\n")
+				outputPhase = "final"
+			}
+			fmt.Print(answer)
+		}
 		return true
 	})
+	fmt.Printf("\nFinish reason: %s; generated tokens: %d", result.FinishReason, len(result.Tokens))
+	if result.StopToken != nil {
+		fmt.Printf("; stop token: %d", *result.StopToken)
+	}
+	fmt.Println()
 	fmt.Printf("Inference time: %s\n", time.Since(inferenceStart).Round(time.Millisecond))
+	performance := inferencePerformance(result.Metrics, firstVisibleSeconds, ioBefore, readProcessIO())
+	performance.Cache = cacheDiagnostics(reader.ExpertCacheStats())
+	performance.CacheHits = performance.Cache.ExpertHits - cacheBefore.CacheHits
+	performance.ResidentHits = performance.Cache.ResidentHits - cacheBefore.ResidentHits
+	fmt.Printf("Prefill: %.3fs (%d prompt tokens); decode: %.3f tokens/s (%d steps); first answer: %.3fs\n", performance.PrefillSeconds, performance.PromptTokens, performance.DecodeTokensPerSec, performance.DecodeSteps, performance.FirstVisibleSeconds)
+	if performance.IOAvailable {
+		fmt.Printf("Process storage reads: %.2f MiB; major faults: %d\n", float64(performance.ReadBytes)/(1<<20), performance.MajorFaults)
+	}
 	if expertStats || hasCache {
 		stats := reader.ExpertCacheStats()
-		fmt.Printf("Expert weights: %d selected ranges, %.2f MiB; %d mapped runs; %d cache hits; %.2f MiB locked; %d lock failures\n",
+		fmt.Printf("Expert weights: %d selected ranges, %.2f MiB; %d mapped runs; %d cache hits; %.2f MiB cached; %d lock failures\n",
 			stats.SelectedRanges, float64(stats.SelectedBytes)/(1<<20), stats.MappedRuns,
 			stats.CacheHits, float64(stats.CachedBytes)/(1<<20), stats.LockFailures)
+		fmt.Printf("Shared cache: %.2f / %.2f MiB retained; %.2f MiB pinned; resident %.2f MiB (%d hits); %d evictions\n", float64(stats.RetainedBytes)/(1<<20), float64(stats.BudgetBytes)/(1<<20), float64(stats.PinnedBytes)/(1<<20), float64(stats.ResidentBytes)/(1<<20), stats.ResidentHits, stats.Evictions)
 		fmt.Printf("Expert prefetch: %d bounded requests; %d failures\n", stats.PrefetchCalls, stats.PrefetchFailures)
 		if expertStats {
 			ranges := make([]ggufindex.Range, 0, len(stats.RangeUses))

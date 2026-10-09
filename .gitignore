@@ -4,6 +4,7 @@
 *.pprof
 *.prof
 coverage.out
+/tests/.overlay-*/
 
 # Local model weights.
 /model/

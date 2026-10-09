@@ -8,6 +8,13 @@ import (
 	"simd"
 )
 
+var quantDotQ80Pair = quantQ80PairPortable
+
+func quantQ80PairPortable(rows []byte, x []float32) (float32, float32) {
+	rowBytes := len(x) / q80Elements * q80BlockBytes
+	return quantDotQ80(rows[:rowBytes], x), quantDotQ80(rows[rowBytes:2*rowBytes], x)
+}
+
 // Keep scale conversion in integer registers, avoiding scalar SSE calls in an
 // AVX loop. Subnormals, signed zero, infinities and NaN payloads are preserved.
 func quantFloat16Bits(h uint16) uint32 {

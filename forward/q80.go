@@ -62,12 +62,21 @@ func MulQ80Argmax(
 	results := make([]workerResult, workers)
 	pool := newQuantWorkers(workers, func(worker int, job quantRowJob) {
 		local := workerResult{token: job.firstRow + job.begin, logit: float32(math.Inf(-1))}
-		for row := job.begin; row < job.end; row++ {
+		row := job.begin
+		for ; row+1 < job.end; row += 2 {
 			if ctx.Err() != nil {
 				break
 			}
-			encoded := job.data[row*rowBytes : (row+1)*rowBytes]
-			val := dotQ80(encoded, x)
+			a, b := quantDotQ80Pair(job.data[row*rowBytes:(row+2)*rowBytes], x)
+			if a > local.logit {
+				local = workerResult{token: job.firstRow + row, logit: a}
+			}
+			if b > local.logit {
+				local = workerResult{token: job.firstRow + row + 1, logit: b}
+			}
+		}
+		if row < job.end && ctx.Err() == nil {
+			val := dotQ80(job.data[row*rowBytes:(row+1)*rowBytes], x)
 			if val > local.logit {
 				local = workerResult{token: job.firstRow + row, logit: val}
 			}
@@ -120,10 +129,14 @@ func MulQ80Into(ctx context.Context, reader *ggufmmap.Reader, tensor ggufindex.T
 	rowsPerWindow := int(min(window/uint64(rowBytes), uint64(output)))
 	workers := min(max(options.Workers, 1), runtime.GOMAXPROCS(0), rowsPerWindow)
 	pool := newQuantWorkers(workers, func(_ int, job quantRowJob) {
-		for row := job.begin; row < job.end; row++ {
+		row := job.begin
+		for ; row+1 < job.end; row += 2 {
 			if ctx.Err() != nil {
-				break
+				return
 			}
+			y[job.firstRow+row], y[job.firstRow+row+1] = quantDotQ80Pair(job.data[row*rowBytes:(row+2)*rowBytes], x)
+		}
+		if row < job.end && ctx.Err() == nil {
 			y[job.firstRow+row] = dotQ80(job.data[row*rowBytes:(row+1)*rowBytes], x)
 		}
 	})

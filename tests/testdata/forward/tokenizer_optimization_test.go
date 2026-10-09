@@ -103,12 +103,12 @@ func TestTokenizerOptimizationGreedy(t *testing.T) {
 	for _, r := range alphabet {
 		tokens = append(tokens, string(r))
 	}
-	tokens = append(tokens, optimizationBPE(" äöüß €\n\t"), "abc")
+	tokens = append(tokens, optimizationBPE(" \u00e4\u00f6\u00fc\u00df €\n\t"), "abc")
 	tok, err := LoadTokenizer(optimizationTokenizerModel(t, tokens))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, text := range []string{"", "abcabcd!", "abczabcdx", "<|end|>abc", " äöüß €\n\t", "🙂", "\x00\xff\xfe", strings.Repeat("abc?", 200)} {
+	for _, text := range []string{"", "abcabcd!", "abczabcdx", "<|end|>abc", " \u00e4\u00f6\u00fc\u00df €\n\t", "🙂", "\x00\xff\xfe", strings.Repeat("abc?", 200)} {
 		t.Run(fmt.Sprintf("%q", text), func(t *testing.T) {
 			got, want := tok.Encode(text), optimizationLegacyEncode(tok, text)
 			if !slices.Equal(got, want) {
@@ -166,7 +166,7 @@ func TestTokenizerOptimizationReference(t *testing.T) {
 }
 
 func TestTokenizerOptimizationBufferedLoad(t *testing.T) {
-	text := strings.Repeat(" ä", 2048)
+	text := strings.Repeat(" \u00e4", 2048)
 	tokens := []string{optimizationBPE(text), "<|end|>", "", "<|end|>"}
 	tok, err := LoadTokenizer(optimizationTokenizerModel(t, tokens))
 	if err != nil {

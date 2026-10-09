@@ -387,7 +387,6 @@ func readFile(path string) (
 			"tensor data starts beyond the end of the file",
 		)
 	}
-
 	tensors := make([]Tensor, 0, len(infos))
 	for _, info := range infos {
 		byteSize, err := tensorSize(info.typ, info.shape)

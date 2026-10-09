@@ -15,6 +15,7 @@ const DefaultPrefillBatchSize = 32
 // Like ForwardToken, it is not safe to call concurrently on the same engine.
 // Cache and activation buffers may be partially updated on error or cancellation.
 func (e *Engine) Prefill(ctx context.Context, tokens []int, startPos int) (int, error) {
+	e.resetPrefix()
 	return e.prefill(ctx, tokens, startPos, nil)
 }
 

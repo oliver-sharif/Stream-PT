@@ -314,17 +314,20 @@ func TestWithExpertRangesCache(t *testing.T) {
 	expertAssertUnmapped(t, paths)
 	read(ranges)
 	second := r.ExpertCacheStats()
-	if second.CachedBytes > options.MaxBytes || second.CachedBytes%page != 0 || second.CachedRuns+second.LockFailures != 1 {
+	if second.CachedBytes != page || second.CachedRuns != 1 || second.LockFailures > 1 || second.RetainedBytes != page {
 		t.Fatalf("incorrect cache admission: %+v", second)
+	}
+	wantPinned := page
+	if second.LockFailures == 1 {
+		wantPinned = 0
+	}
+	if second.PinnedBytes != wantPinned {
+		t.Fatalf("incorrect best-effort pinning: %+v", second)
 	}
 	read(ranges)
 	third := r.ExpertCacheStats()
-	if second.CachedRuns == 1 {
-		if third.CacheHits != 1 || third.MappedRuns != 2 || third.CachedBytes != page {
-			t.Fatalf("retained run not reused: %+v", third)
-		}
-	} else if third.CacheHits != 0 || third.MappedRuns != 3 {
-		t.Fatalf("failed lock changed correctness: %+v", third)
+	if third.CacheHits != 1 || third.MappedRuns != 2 || third.CachedBytes != page || third.LockFailures != second.LockFailures {
+		t.Fatalf("retained run not reused, even without pinning: %+v", third)
 	}
 	if third.SelectedRanges != 6 || third.SelectedBytes != 141 || third.RangeUses[ranges[0]] != 3 || third.RangeUses[ranges[1]] != 3 {
 		t.Fatalf("incorrect hot frequencies: %+v", third)
@@ -342,15 +345,13 @@ func TestWithExpertRangesCache(t *testing.T) {
 	if afterOther.CachedBytes > options.MaxBytes {
 		t.Fatalf("cache budget exceeded: %+v", afterOther)
 	}
-	if third.CachedRuns == 1 {
-		if afterOther.CachedRuns != 1 || afterOther.CachedBytes != page || afterOther.LockFailures != third.LockFailures {
-			t.Fatalf("full cache admitted another run: %+v", afterOther)
-		}
-		beforeHit := r.ExpertCacheStats()
-		read(ranges)
-		if afterHit := r.ExpertCacheStats(); afterHit.CacheHits != beforeHit.CacheHits+1 || afterHit.MappedRuns != beforeHit.MappedRuns {
-			t.Fatalf("first-come run was evicted: %+v", afterHit)
-		}
+	if afterOther.CachedRuns != 1 || afterOther.CachedBytes != page || afterOther.LockFailures != third.LockFailures {
+		t.Fatalf("colder run displaced hotter resident: %+v", afterOther)
+	}
+	beforeHit := r.ExpertCacheStats()
+	read(ranges)
+	if afterHit := r.ExpertCacheStats(); afterHit.CacheHits != beforeHit.CacheHits+1 || afterHit.MappedRuns != beforeHit.MappedRuns {
+		t.Fatalf("hotter run was evicted: %+v", afterHit)
 	}
 	sentinel := errors.New("cached callback error")
 	if err := r.WithExpertRanges(ranges, func(int, []byte) error { return sentinel }); !errors.Is(err, sentinel) {

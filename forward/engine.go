@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"time"
 	"unicode/utf8"
 
 	"Stream-PT/ggufindex"
@@ -39,6 +40,8 @@ type Engine struct {
 	Scratch        *LayerScratch
 	Tokenizer      *Tokenizer
 	prefillScratch *prefillScratch
+	prefixSession  string
+	prefixTokens   []int
 }
 
 // NewEngineWithOptions initializes the inference engine with user-defined options.
@@ -118,11 +121,26 @@ func NewEngineWithOptions(model *ggufindex.Model, reader *ggufmmap.Reader, optio
 			"<|eom_id|>",
 		}
 		for _, stopStr := range knownStopTokens {
+			if tokenizer.isHarmony() && (stopStr == "<|end|>" || stopStr == "<|im_end|>") {
+				continue
+			}
 			if id, ok := tokenizer.TokenMap[stopStr]; ok {
 				if !cfg.IsEOS(id) {
 					cfg.EOSTokens = append(cfg.EOSTokens, id)
 				}
 			}
+		}
+		if tokenizer.isHarmony() {
+			if tokenizer.isMessageEnd(cfg.EOS) {
+				cfg.EOS = -1
+			}
+			stops := cfg.EOSTokens[:0]
+			for _, id := range cfg.EOSTokens {
+				if !tokenizer.isMessageEnd(id) {
+					stops = append(stops, id)
+				}
+			}
+			cfg.EOSTokens = stops
 		}
 	}
 
@@ -145,6 +163,7 @@ func NewEngineWithOptions(model *ggufindex.Model, reader *ggufmmap.Reader, optio
 // ForwardToken processes a single token at position pos through all transformer layers
 // and returns the greedy next token ID. Generate uses configurable sampling.
 func (e *Engine) ForwardToken(ctx context.Context, tokenID, pos int) (int, error) {
+	e.resetPrefix()
 	return e.forwardToken(ctx, tokenID, pos, true, nil)
 }
 
@@ -219,6 +238,9 @@ func (e *Engine) IsEOS(tokenID int) bool {
 	if e == nil {
 		return false
 	}
+	if e.Tokenizer.isHarmony() && e.Tokenizer.isMessageEnd(tokenID) {
+		return false
+	}
 	if e.Config != nil && e.Config.IsEOS(tokenID) {
 		return true
 	}
@@ -247,52 +269,204 @@ func (e *Engine) Generate(
 
 // GenerateWithSampling uses request-local sampling state without changing engine options.
 func (e *Engine) GenerateWithSampling(ctx context.Context, promptTokens []int, maxNewTokens int, options SamplingOptions, onToken func(int, string) bool) ([]int, error) {
+	result, err := e.GenerateWithSamplingResult(ctx, promptTokens, maxNewTokens, options, onToken)
+	return result.Tokens, err
+}
+
+// GenerationResult distinguishes completion from exhausted budgets and tool handoff.
+type GenerationResult struct {
+	Tokens       []int
+	FinishReason string
+	StopToken    *int
+	Metrics      GenerationMetrics
+}
+
+// GenerationMetrics separates prompt processing from decode compute and stream delivery.
+type GenerationMetrics struct {
+	PromptTokens       int     `json:"prompt_tokens"`
+	ReusedPromptTokens int     `json:"reused_prompt_tokens"`
+	PrefillSeconds     float64 `json:"prefill_seconds"`
+	DecodeSeconds      float64 `json:"decode_seconds"`
+	DecodeSteps        int     `json:"decode_steps"`
+	DecodeTokensPerSec float64 `json:"decode_tokens_per_second"`
+	FirstTokenSeconds  float64 `json:"first_token_seconds"`
+	TotalSeconds       float64 `json:"total_seconds"`
+}
+
+func (e *Engine) resetPrefix() {
+	e.prefixSession = ""
+	e.prefixTokens = nil
+}
+
+// GenerateWithSamplingResult streams valid UTF-8 and reports why generation stopped.
+func (e *Engine) GenerateWithSamplingResult(ctx context.Context, promptTokens []int, maxNewTokens int, options SamplingOptions, onToken func(int, string) bool) (result GenerationResult, err error) {
+	return e.GenerateWithSessionResult(ctx, "", promptTokens, maxNewTokens, options, onToken)
+}
+
+// GenerateWithSessionResult reuses the last session's exact KV prefix. An empty
+// session disables reuse. Like Prefill, calls must be externally serialized.
+// Only one session is retained, so memory usage does not grow with client count.
+func (e *Engine) GenerateWithSessionResult(ctx context.Context, session string, promptTokens []int, maxNewTokens int, options SamplingOptions, onToken func(int, string) bool) (result GenerationResult, err error) {
+	started := time.Now()
+	result.Metrics.PromptTokens = len(promptTokens)
+	result.FinishReason = "error"
+	defer func() {
+		result.Metrics.TotalSeconds = time.Since(started).Seconds()
+		if result.Metrics.DecodeSeconds > 0 {
+			result.Metrics.DecodeTokensPerSec = float64(result.Metrics.DecodeSteps) / result.Metrics.DecodeSeconds
+		}
+		if ctx != nil && ctx.Err() != nil {
+			result.FinishReason = "cancelled"
+		}
+		if err != nil || session == "" || (ctx != nil && ctx.Err() != nil) {
+			e.resetPrefix()
+		}
+	}()
 	if len(promptTokens) == 0 {
-		return nil, fmt.Errorf("empty prompt tokens")
+		return result, fmt.Errorf("empty prompt tokens")
 	}
 	if maxNewTokens <= 0 {
 		maxNewTokens = 64
 	}
 	sampler, err := newTokenSampler(options, promptTokens)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 
-	var generated []int
 	var nextToken int
+	var decoder utf8Stream
+	lastToken := -1
 
-	nextToken, err = e.prefill(ctx, promptTokens, 0, sampler)
+	startPos := 0
+	if session != "" && session == e.prefixSession {
+		for startPos < min(len(promptTokens), len(e.prefixTokens)) && promptTokens[startPos] == e.prefixTokens[startPos] {
+			startPos++
+		}
+		// Recompute the last prompt position to restore its activation before sampling.
+		startPos = min(startPos, len(promptTokens)-1)
+	}
+	e.resetPrefix()
+	result.Metrics.ReusedPromptTokens = startPos
+	prefillStarted := time.Now()
+	nextToken, err = e.prefill(ctx, promptTokens[startPos:], startPos, sampler)
+	result.Metrics.PrefillSeconds = time.Since(prefillStarted).Seconds()
 	if err != nil {
-		return nil, err
+		return result, err
+	}
+	if session != "" {
+		e.prefixSession = session
+		e.prefixTokens = append([]int(nil), promptTokens...)
 	}
 
+	result.FinishReason = "length"
 	pos := len(promptTokens)
 	for i := 0; i < maxNewTokens; i++ {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
 		if e.IsEOS(nextToken) {
+			result.FinishReason = "stop"
+			result.StopToken = new(int)
+			*result.StopToken = nextToken
+			if e.Tokenizer != nil && nextToken >= 0 && nextToken < len(e.Tokenizer.Tokens) {
+				switch e.Tokenizer.Tokens[nextToken] {
+				case "<|call|>", "<|ghissue|>":
+					result.FinishReason = "tool_calls"
+				}
+			}
 			break
 		}
-		generated = append(generated, nextToken)
+		result.Tokens = append(result.Tokens, nextToken)
+		if len(result.Tokens) == 1 {
+			result.Metrics.FirstTokenSeconds = time.Since(started).Seconds()
+		}
+		lastToken = nextToken
 		sampler.accept(nextToken)
 		tokenText := ""
 		if e.Tokenizer != nil {
-			tokenText = e.Tokenizer.Decode([]int{nextToken})
+			tokenText = decoder.push(e.Tokenizer.Decode([]int{nextToken}), i+1 == maxNewTokens)
 		}
 		if onToken != nil {
 			if !onToken(nextToken, tokenText) {
-				break
+				result.FinishReason = "callback"
+				return result, nil
 			}
 		}
 		if i+1 == maxNewTokens {
 			break
 		}
-		nextToken, err = e.forwardToken(ctx, nextToken, pos, true, sampler)
+		if pos >= e.KVCache.MaxPos {
+			result.FinishReason = "context_length"
+			break
+		}
+		processedToken := nextToken
+		decodeStarted := time.Now()
+		nextToken, err = e.forwardToken(ctx, processedToken, pos, true, sampler)
+		result.Metrics.DecodeSeconds += time.Since(decodeStarted).Seconds()
 		if err != nil {
-			return generated, fmt.Errorf("generation step %d (token %d): %w", i, nextToken, err)
+			result.FinishReason = "error"
+			return result, fmt.Errorf("generation step %d (token %d): %w", i, nextToken, err)
+		}
+		result.Metrics.DecodeSteps++
+		if session != "" {
+			e.prefixTokens = append(e.prefixTokens, processedToken)
 		}
 		pos++
 	}
 
-	return generated, nil
+	if tail := decoder.push("", true); tail != "" && onToken != nil && lastToken >= 0 {
+		if !onToken(lastToken, tail) {
+			result.FinishReason = "callback"
+		}
+	}
+	return result, nil
+}
+
+type utf8Stream struct {
+	pending string
+}
+
+func (s *utf8Stream) push(text string, final bool) string {
+	s.pending += text
+	var out []byte
+	i := 0
+	for i < len(s.pending) {
+		if !final && !utf8.FullRuneInString(s.pending[i:]) {
+			break
+		}
+		r, size := utf8.DecodeRuneInString(s.pending[i:])
+		out = utf8.AppendRune(out, r)
+		i += size
+	}
+	s.pending = s.pending[i:]
+	return string(out)
+}
+
+func (t *Tokenizer) isHarmony() bool {
+	if t == nil {
+		return false
+	}
+	if t.TokenMap != nil {
+		_, ret := t.TokenMap["<|return|>"]
+		_, fim := t.TokenMap["<|fim_suffix|>"]
+		_, call := t.TokenMap["<|call|>"]
+		_, issue := t.TokenMap["<|ghissue|>"]
+		return (ret || fim) && (call || issue)
+	}
+	completion, handoff := false, false
+	for _, token := range t.Tokens {
+		switch token {
+		case "<|return|>", "<|fim_suffix|>":
+			completion = true
+		case "<|call|>", "<|ghissue|>":
+			handoff = true
+		}
+	}
+	return completion && handoff
+}
+
+func (t *Tokenizer) isMessageEnd(id int) bool {
+	return t != nil && id >= 0 && id < len(t.Tokens) && (t.Tokens[id] == "<|end|>" || t.Tokens[id] == "<|im_end|>")
 }
 
 // Tokenizer decodes and encodes tokens from GGUF metadata using byte-level BPE.

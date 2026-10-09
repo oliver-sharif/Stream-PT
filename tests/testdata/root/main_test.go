@@ -132,7 +132,7 @@ func TestChatServerValidation(t *testing.T) {
 	srv := &ChatServer{DefaultMaxTokens: 10}
 	handler := srv.routes()
 	for _, field := range []string{`"top_k":-1`, `"top_p":0`, `"top_p":1.1`, `"min_p":-1`, `"repeat_penalty":0`, `"repeat_last_n":-2`, `"seed":-1`, `"temperature":"hot"`} {
-		req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"prompt":"Ja",`+field+`}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"prompt":"Yes",`+field+`}`))
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusBadRequest {
@@ -141,7 +141,7 @@ func TestChatServerValidation(t *testing.T) {
 	}
 
 	t.Run("InvalidTemperature", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"prompt":"Ja","temperature":-1}`))
+		req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"prompt":"Yes","temperature":-1}`))
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)
 		if rec.Code != http.StatusBadRequest {
@@ -178,7 +178,7 @@ func TestChatServerValidation(t *testing.T) {
 }
 
 func TestChatServerSSEStreaming(t *testing.T) {
-	const dim, vocab = 32, 12
+	const dim, vocab = 32, 14
 	path := filepath.Join(t.TempDir(), "server_gen.bin")
 	var data []byte
 	add := func(typ uint32, shape []uint64, values []byte) ggufindex.Tensor {
@@ -206,8 +206,8 @@ func TestChatServerSSEStreaming(t *testing.T) {
 		binary.LittleEndian.PutUint16(weights[id*34:], 0x3c00)
 		weights[id*34+2+id-1] = 1
 	}
-	// Ensure token 1 ("Ja") has highest logit after prompt
-	weights[1*34+2+6] = 10
+	// Ensure token 1 ("Yes") has highest logit after prompt
+	weights[1*34+2+10] = 10
 	output := add(8, []uint64{dim, vocab}, weights)
 	if err := os.WriteFile(path, data, 0600); err != nil {
 		t.Fatal(err)
@@ -222,14 +222,15 @@ func TestChatServerSSEStreaming(t *testing.T) {
 		Reader: reader, Config: &forward.Config{EOS: 99, RMSNormEps: 1e-5, HiddenDim: dim, NumHeads: 1, NumKVHeads: 1, HeadDim: 2},
 		TokenEmbd: embd, OutputNorm: norm, OutputWeight: output,
 		Options: forward.EngineOptions{PrefillBatchSize: 1},
-		KVCache: forward.NewKVCache(0, 20, 1, 2), X: make([]float32, dim),
+		KVCache: forward.NewKVCache(0, 128, 1, 2), X: make([]float32, dim),
 		Scratch: &forward.LayerScratch{NormedX: make([]float32, dim)},
 		Tokenizer: &forward.Tokenizer{
-			Tokens: []string{"prompt", "Ja", "!", "test", "It", "<|start|>", "<|message|>", "<|end|>", "<|channel|>", "user", "assistant", "final"},
+			Tokens: []string{"prompt", "Yes", "!", "test", "It", "<|start|>", "<|message|>", "<|end|>", "<|channel|>", "user", "assistant", "final", "<|return|>", "<|call|>"},
 			TokenMap: map[string]int{
-				"prompt": 0, "Ja": 1, "!": 2, "test": 3, "It": 4,
+				"prompt": 0, "Yes": 1, "!": 2, "test": 3, "It": 4,
 				"<|start|>": 5, "<|message|>": 6, "<|end|>": 7, "<|channel|>": 8,
 				"user": 9, "assistant": 10, "final": 11,
+				"<|return|>": 12, "<|call|>": 13,
 			},
 		},
 	}
@@ -247,7 +248,7 @@ func TestChatServerSSEStreaming(t *testing.T) {
 			{`"temperature":0,"frequency_penalty":100`, 0},
 			{`"temperature":0,"repeat_penalty":1`, 1}, // Request history and overrides must not leak.
 		} {
-			req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"messages":[{"role":"user","content":"Ja"}],"max_tokens":1,`+tc.fields+`}`))
+			req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(`{"messages":[{"role":"user","content":"Yes"}],"max_tokens":1,`+tc.fields+`}`))
 			rec := httptest.NewRecorder()
 			srv.routes().ServeHTTP(rec, req)
 			var events []ChatEvent
@@ -260,14 +261,14 @@ func TestChatServerSSEStreaming(t *testing.T) {
 					events = append(events, event)
 				}
 			}
-			if len(events) != 2 || events[0].Token != tc.want || events[0].Error != "" || !events[1].Done {
+			if len(events) != 2 || events[0].Token != tc.want || events[0].Error != "" || !events[1].Done || events[1].FinishReason != "length" || events[1].GeneratedTokens != 1 || events[1].StopToken != nil {
 				t.Fatalf("%s: events %+v, want token %d and done", tc.fields, events, tc.want)
 			}
 		}
 	})
 
 	t.Run("DefaultStreaming", func(t *testing.T) {
-		reqBody := `{"messages":[{"role":"user","content":"Ja"}]}`
+		reqBody := `{"messages":[{"role":"user","content":"Yes"}]}`
 		resp, err := http.Post(ts.URL+"/api/chat", "application/json", strings.NewReader(reqBody))
 		if err != nil {
 			t.Fatal(err)
@@ -314,7 +315,7 @@ func TestChatServerSSEStreaming(t *testing.T) {
 	})
 
 	t.Run("CustomMaxTokensAndSystemPrompt", func(t *testing.T) {
-		reqBody := `{"system_prompt":"You are helper","messages":[{"role":"user","content":"Ja"}],"max_tokens":2}`
+		reqBody := `{"system_prompt":"You are helper","messages":[{"role":"user","content":"Yes"}],"max_tokens":2}`
 		resp, err := http.Post(ts.URL+"/api/chat", "application/json", strings.NewReader(reqBody))
 		if err != nil {
 			t.Fatal(err)

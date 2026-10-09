@@ -45,7 +45,7 @@ func TestTokenizerInspection(t *testing.T) {
 	testCases := []string{
 		"Hello, just say Yes!",
 		"Good day! How are you?\nVery well, thank you.",
-		"Special: äöüß € 123 \t \r\n",
+		"Special: \u00e4\u00f6\u00fc\u00df € 123 \t \r\n",
 	}
 
 	if tt, ok := model.Metadata["tokenizer.ggml.token_type"]; ok {

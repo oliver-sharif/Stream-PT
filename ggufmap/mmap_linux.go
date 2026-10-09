@@ -16,14 +16,22 @@ import (
 // file can cause a fatal fault. Mapped pages still consume physical RAM through
 // the OS page cache, even though they are not allocated on the Go heap.
 type Reader struct {
-	files           map[string]*os.File
-	mu              sync.Mutex
-	used            bool
-	closed          bool
-	expertOptions   ExpertCacheOptions
-	expertStats     ExpertCacheStats
-	expertCache     map[ggufindex.Range][]byte
-	expertLookahead bool
+	files            map[string]*os.File
+	fileSizes        map[string]uint64
+	mu               sync.Mutex
+	used             bool
+	closed           bool
+	activeCalls      uint64
+	expertOptions    ExpertCacheOptions
+	expertStats      ExpertCacheStats
+	expertCache      map[ggufindex.Range]*cacheEntry
+	frequencies      map[ggufindex.Range]uint64
+	cacheClock       uint64
+	lockPages        func([]byte) error
+	residentRanges   map[ggufindex.Range]uint64
+	residentByFile   map[string][]ggufindex.Range
+	residentReserved uint64
+	expertLookahead  bool
 }
 
 // DefaultExpertCoalesceBytes bounds selected bytes in a coalesced mapping.
@@ -34,17 +42,36 @@ const DefaultExpertCoalesceBytes uint64 = 32 << 20
 // Linux can truncate a larger WILLNEED request to its device readahead window.
 const DefaultExpertPrefetchBytes = 128 << 10
 
-// ExpertCacheOptions enables optional hot-run retention. MaxBytes is charged
-// for the full page-rounded mapping, including leading alignment. MinUses is
-// the admission threshold for every expert in a run (zero means one).
-// Admission is first come, with no eviction. Failed mlock is nonfatal and the
-// mapping is not retained. Only exactly adjacent selected ranges are retained;
-// page alignment may necessarily include bytes outside the requested ranges.
-// With both MaxBytes and TrackStats zero, no per-range history is kept.
+// DefaultExpertCacheBytes is the recommended shared retention budget for callers.
+// Open leaves retention disabled until ConfigureExpertCache is called.
+const DefaultExpertCacheBytes uint64 = 2 << 30
+
+const DefaultExpertLookaheadBytes uint64 = 32 << 20
+
+// Cover the complete selected run by default. Limiting advice while using
+// MADV_RANDOM leaves the remaining pages to small synchronous storage reads.
+const DefaultExpertPrefetchLimitBytes uint64 = ^uint64(0)
+const DefaultExpertAgingInterval uint64 = 1024
+
+// ExpertCacheOptions enables LFU retention with periodic frequency halving and
+// LRU tie-breaking. MaxBytes includes resident tensors and full page-rounded
+// mappings. Active leases and resident tensors cannot be evicted. MinUses is the
+// admission threshold for each selected range (zero means one). Pinning is best
+// effort: mlock failures never prevent retention. Zero tuning values use the
+// defaults above. LookaheadRuns is the number of runs prepared ahead of the
+// current run (zero means one; values outside 0..8 are rejected). LookaheadBytes
+// bounds their combined page footprint, not the current run or concurrent calls.
+// PrefetchBytes bounds advice per new mapping.
+// The budget limits retained mappings, not transient mappings or OS page cache.
 type ExpertCacheOptions struct {
-	MaxBytes   uint64
-	MinUses    uint64
-	TrackStats bool
+	MaxBytes        uint64
+	MinUses         uint64
+	TrackStats      bool
+	AgingInterval   uint64
+	LookaheadBytes  uint64
+	LookaheadRuns   int
+	PrefetchBytes   uint64
+	DisablePrefetch bool
 }
 
 // ExpertCacheStats is an independent snapshot. MappedBytes counts selected
@@ -55,38 +82,59 @@ type ExpertCacheOptions struct {
 // SelectedRanges and SelectedBytes count complete validated selections, including
 // cache hits and ranges not visited after a callback error. Invalid calls add none.
 type ExpertCacheStats struct {
-	RangeUses        map[ggufindex.Range]uint64
-	SelectedRanges   uint64
-	SelectedBytes    uint64
-	MappedRuns       uint64
-	MappedBytes      uint64
-	MappedPageBytes  uint64
-	CacheHits        uint64
-	CachedRuns       uint64
-	CachedBytes      uint64
-	LockFailures     uint64
-	PrefetchCalls    uint64
-	PrefetchFailures uint64
+	RangeUses              map[ggufindex.Range]uint64
+	SelectedRanges         uint64
+	SelectedBytes          uint64
+	MappedRuns             uint64
+	MappedBytes            uint64
+	MappedPageBytes        uint64
+	CacheHits              uint64
+	CachedRuns             uint64
+	CachedBytes            uint64
+	LockFailures           uint64
+	PrefetchCalls          uint64
+	PrefetchFailures       uint64
+	BudgetBytes            uint64
+	RetainedBytes          uint64
+	PinnedBytes            uint64
+	Evictions              uint64
+	EvictedBytes           uint64
+	AdmissionFailures      uint64
+	AgingPasses            uint64
+	ActiveLeases           uint64
+	ResidentRuns           uint64
+	ResidentBytes          uint64
+	ResidentHits           uint64
+	ResidentBudgetBytes    uint64
+	ResidentConfiguredRuns uint64
 }
 
 // ConfigureExpertCache must be called before any range is used on this Reader.
 func (r *Reader) ConfigureExpertCache(options ExpertCacheOptions) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.used || r.closed {
+	if r.used || r.closed || r.residentRanges != nil {
 		return fmt.Errorf("expert cache must be configured before use")
 	}
+	if options.LookaheadRuns < 0 || options.LookaheadRuns > 8 {
+		return fmt.Errorf("expert lookahead runs must be between 0 and 8")
+	}
 	r.expertOptions = options
-	r.expertStats = ExpertCacheStats{}
+	r.expertStats = ExpertCacheStats{BudgetBytes: options.MaxBytes}
 	if options.MaxBytes != 0 || options.TrackStats {
 		r.expertStats.RangeUses = make(map[ggufindex.Range]uint64)
+	}
+	if options.MaxBytes != 0 {
+		r.frequencies = make(map[ggufindex.Range]uint64)
+	} else {
+		r.frequencies = nil
 	}
 	r.expertCache = nil
 	return nil
 }
 
-// ConfigureExpertLookahead controls one selected run of prefetch lookahead (on by default).
-// Configure before use. At most two transient expert runs are mapped per call.
+// ConfigureExpertLookahead controls selected-run prefetch lookahead (on by default).
+// Configure before use. At most LookaheadRuns plus one runs are mapped per call.
 func (r *Reader) ConfigureExpertLookahead(enabled bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -117,40 +165,44 @@ func Open(model *ggufindex.Model) (*Reader, error) {
 		return nil, fmt.Errorf("nil model")
 	}
 
-	r := &Reader{files: make(map[string]*os.File, len(model.Paths)), expertLookahead: true}
+	r := &Reader{files: make(map[string]*os.File, len(model.Paths)), fileSizes: make(map[string]uint64, len(model.Paths)), expertLookahead: true, lockPages: syscall.Mlock}
 	for _, path := range model.Paths {
+		if r.files[path] != nil {
+			continue
+		}
 		f, err := os.Open(path)
 		if err != nil {
 			r.Close()
 			return nil, fmt.Errorf("open %q: %w", path, err)
 		}
 		r.files[path] = f
+		info, err := f.Stat()
+		if err != nil || info.Size() < 0 {
+			r.Close()
+			return nil, fmt.Errorf("stat %q: %w", path, errors.Join(err, fmt.Errorf("invalid file size")))
+		}
+		r.fileSizes[path] = uint64(info.Size())
 	}
 	return r, nil
 }
 
-// Close closes the files. Do not call it concurrently with WithTensor,
-// WithTensorChunks, or WithExpertRanges (including from callbacks).
+// Close rejects new calls immediately. Existing callbacks keep their mappings
+// and files alive until their leases/calls finish, including Close from a callback.
+// It does not wait for callbacks; deferred cleanup errors are returned by those calls.
 func (r *Reader) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	var first error
-	for span, mapped := range r.expertCache {
-		if err := errors.Join(syscall.Munlock(mapped), syscall.Munmap(mapped)); err != nil && first == nil {
-			first = fmt.Errorf("release cached range %v: %w", span, err)
-		}
-		delete(r.expertCache, span)
-	}
-	r.expertStats.CachedRuns = 0
-	r.expertStats.CachedBytes = 0
 	r.closed = true
-	for path, f := range r.files {
-		if err := f.Close(); err != nil && first == nil {
-			first = fmt.Errorf("close %q: %w", path, err)
+	var err error
+	for _, entry := range r.expertCache {
+		if entry.refs == 0 {
+			err = errors.Join(err, r.releaseEntryLocked(entry))
 		}
-		delete(r.files, path)
 	}
-	return first
+	if r.activeCalls == 0 {
+		err = errors.Join(err, r.closeFilesLocked())
+	}
+	return err
 }
 
 // WithTensor provides the tensor's bytes for the duration of fn.
@@ -159,6 +211,10 @@ func (r *Reader) WithTensor(t ggufindex.Tensor, fn func(data []byte) error) (err
 	if fn == nil {
 		return fmt.Errorf("nil callback")
 	}
+	if err := r.beginCall(); err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, r.endCall()) }()
 
 	data, unmap, err := r.mapRange(t.Range)
 	if err != nil {
@@ -178,17 +234,39 @@ func (r *Reader) WithTensor(t ggufindex.Tensor, fn func(data []byte) error) (err
 // minus one byte of leading alignment; the OS also rounds the end to a page.
 // This bounds the active mapping, not physical RAM: mmap uses the file page cache,
 // and readahead or cached pages may outlive a mapping. No global cache is dropped.
-// Files must remain immutable, and Close must not run concurrently with this call.
-func (r *Reader) WithTensorChunks(t ggufindex.Tensor, chunkBytes uint64, fn func(offset uint64, data []byte) error) error {
+// Registered resident tensors reuse one leased mapping for all chunks.
+// Files must remain immutable.
+func (r *Reader) WithTensorChunks(t ggufindex.Tensor, chunkBytes uint64, fn func(offset uint64, data []byte) error) (err error) {
 	if fn == nil {
 		return fmt.Errorf("nil callback")
 	}
 	if chunkBytes == 0 {
 		return fmt.Errorf("zero chunk size")
 	}
-	f, err := r.validateRange(t.Range)
+	if err := r.beginCall(); err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, r.endCall()) }()
+	_, err = r.validateRange(t.Range)
 	if err != nil {
 		return fmt.Errorf("tensor %q: %w", t.Name, err)
+	}
+	r.mu.Lock()
+	data, release, resident, residentErr := r.residentLeaseLocked(t.Range)
+	r.mu.Unlock()
+	if residentErr != nil {
+		return fmt.Errorf("tensor %q: %w", t.Name, residentErr)
+	}
+	if resident {
+		defer func() { err = errors.Join(err, release()) }()
+		for offset := uint64(0); offset < uint64(len(data)); {
+			end := offset + min(chunkBytes, uint64(len(data))-offset)
+			if err := fn(offset, data[int(offset):int(end):int(end)]); err != nil {
+				return err
+			}
+			offset = end
+		}
+		return nil
 	}
 	for start := t.Range.Start; start < t.Range.End; {
 		length := t.Range.End - start
@@ -196,7 +274,7 @@ func (r *Reader) WithTensorChunks(t ggufindex.Tensor, chunkBytes uint64, fn func
 			length = chunkBytes
 		}
 		span := ggufindex.Range{File: t.Range.File, Start: start, End: start + length}
-		data, unmap, err := mapFileRange(f, span, true)
+		data, unmap, err := r.mapRange(span)
 		if err != nil {
 			return fmt.Errorf("tensor %q, offset %d: %w", t.Name, start-t.Range.Start, err)
 		}
@@ -213,17 +291,31 @@ func (r *Reader) WithTensorChunks(t ggufindex.Tensor, chunkBytes uint64, fn func
 }
 
 func (r *Reader) mapRange(span ggufindex.Range) ([]byte, func() error, error) {
-	f, err := r.validateRange(span)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	f, err := r.validateRangeLocked(span)
 	if err != nil {
 		return nil, nil, err
 	}
-	return mapFileRange(f, span, false)
+	if data, release, ok, err := r.residentLeaseLocked(span); ok || err != nil {
+		return data, release, err
+	}
+	entry, err := r.newEntryLocked(f, span, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	data, release := r.leaseLocked(entry, span)
+	return data, release, nil
 }
 
 func (r *Reader) validateRange(span ggufindex.Range) (*os.File, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.used = true
+	return r.validateRangeLocked(span)
+}
+
+func (r *Reader) validateRangeLocked(span ggufindex.Range) (*os.File, error) {
 	f := r.files[span.File]
 	if f == nil {
 		return nil, fmt.Errorf("file %q is not open", span.File)
@@ -232,11 +324,7 @@ func (r *Reader) validateRange(span ggufindex.Range) (*os.File, error) {
 		return nil, fmt.Errorf("empty or invalid range")
 	}
 
-	info, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if info.Size() < 0 || span.End > uint64(info.Size()) {
+	if span.End > r.fileSizes[span.File] {
 		return nil, fmt.Errorf("range exceeds file size")
 	}
 	if _, _, err := mappingBounds(span); err != nil {
@@ -259,6 +347,9 @@ func mapFileRange(f *os.File, span ggufindex.Range, sequential bool) ([]byte, fu
 }
 
 func mappingBounds(span ggufindex.Range) (uint64, uint64, error) {
+	if span.End <= span.Start {
+		return 0, 0, fmt.Errorf("empty or invalid range")
+	}
 	pageSize := uint64(os.Getpagesize())
 	alignedStart := span.Start / pageSize * pageSize
 	length := span.End - alignedStart
@@ -290,12 +381,14 @@ func mmapFileRange(f *os.File, span ggufindex.Range) ([]byte, uint64, error) {
 // valid only during their callback, even when caching is enabled. Adjacent
 // selected ranges share a mapping up to DefaultExpertCoalesceBytes; gaps are
 // never bridged. MADV_RANDOM avoids speculative readahead. No whole tensor is
-// read. Calls and statistics may run concurrently, but Close must not.
+// read. Calls, statistics and Close may run concurrently.
 // By default the next selected run is prefetched before the current callbacks,
-// overlapping its kernel I/O with current computation. Both mappings are released
-// on callback error or panic unless admitted to the optional hot cache.
+// overlapping its kernel I/O with current computation. LookaheadRuns controls
+// queue depth; LookaheadBytes bounds its combined page footprint. An oversized
+// next run stops lookahead without skipping it. All leases are released on
+// callback error or panic; admitted mappings remain in the optional hot cache.
 // An empty selection succeeds without invoking fn, which may then be nil.
-func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, data []byte) error) error {
+func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, data []byte) error) (err error) {
 	if len(ranges) == 0 {
 		return nil
 	}
@@ -307,14 +400,21 @@ func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, d
 		index int
 		file  *os.File
 	}
-	r.mu.Lock()
-	r.used = true
-	closed := r.closed
-	lookahead := r.expertLookahead
-	r.mu.Unlock()
-	if closed {
-		return fmt.Errorf("reader is closed")
+	if err := r.beginCall(); err != nil {
+		return err
 	}
+	defer func() { err = errors.Join(err, r.endCall()) }()
+	r.mu.Lock()
+	lookahead := r.expertLookahead
+	lookaheadRuns := r.expertOptions.LookaheadRuns
+	if lookaheadRuns == 0 {
+		lookaheadRuns = 1
+	}
+	lookaheadBytes := r.expertOptions.LookaheadBytes
+	if lookaheadBytes == 0 {
+		lookaheadBytes = DefaultExpertLookaheadBytes
+	}
+	r.mu.Unlock()
 	selected := make([]selectedRange, len(ranges))
 	for index, span := range ranges {
 		f, err := r.validateRange(span)
@@ -343,15 +443,17 @@ func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, d
 		if r.expertStats.RangeUses != nil {
 			r.expertStats.RangeUses[item.span]++
 		}
+		r.recordUseLocked(item.span)
 	}
 	r.mu.Unlock()
 	type expertRun struct {
 		span       ggufindex.Range
 		first, end int
+		pageBytes  uint64
 		data       []byte
 		release    func() error
 	}
-	prepare := func(first int) (expertRun, error) {
+	runBounds := func(first int) (ggufindex.Range, int) {
 		end := first + 1
 		run := selected[first].span
 		for end < len(selected) {
@@ -362,46 +464,77 @@ func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, d
 			run.End = next.End
 			end++
 		}
+		return run, end
+	}
+	prepare := func(first int) (expertRun, error) {
+		run, end := runBounds(first)
+		pageBytes, err := mappingPageBytes(run)
+		if err != nil {
+			return expertRun{}, err
+		}
 		hot := false
+		frequency := ^uint64(0)
 		r.mu.Lock()
 		if r.expertOptions.MaxBytes != 0 {
 			hot = true
 			for _, item := range selected[first:end] {
+				frequency = min(frequency, r.frequencies[item.span])
 				if r.expertStats.RangeUses[item.span] < r.expertOptions.MinUses {
 					hot = false
 				}
 			}
 		}
 		r.mu.Unlock()
-		data, release, err := r.mapExpertRun(selected[first].file, run, hot)
+		data, release, err := r.mapExpertRun(selected[first].file, run, hot, frequency)
 		if err != nil {
 			return expertRun{}, fmt.Errorf("expert run %v: %w", run, err)
 		}
-		return expertRun{span: run, first: first, end: end, data: data, release: release}, nil
+		return expertRun{span: run, first: first, end: end, pageBytes: pageBytes, data: data, release: release}, nil
 	}
 	return func() (err error) {
-		var current, next expertRun
+		var current expertRun
+		queue := make([]expertRun, 0, lookaheadRuns)
+		var queuedBytes uint64
 		defer func() {
 			if current.release != nil {
 				err = errors.Join(err, current.release())
 			}
-			if next.release != nil {
-				err = errors.Join(err, next.release())
+			for _, run := range queue {
+				err = errors.Join(err, run.release())
 			}
 		}()
 		for first := 0; first < len(selected); {
-			if next.release != nil {
-				current, next = next, expertRun{}
+			if len(queue) != 0 {
+				current = queue[0]
+				queuedBytes -= current.pageBytes
+				copy(queue, queue[1:])
+				queue[len(queue)-1] = expertRun{}
+				queue = queue[:len(queue)-1]
 			} else {
 				current, err = prepare(first)
 				if err != nil {
 					return err
 				}
 			}
-			if lookahead && current.end < len(selected) {
-				next, err = prepare(current.end)
-				if err != nil {
-					return err
+			if lookahead {
+				nextFirst := current.end
+				if len(queue) != 0 {
+					nextFirst = queue[len(queue)-1].end
+				}
+				for len(queue) < lookaheadRuns && nextFirst < len(selected) {
+					span, _ := runBounds(nextFirst)
+					pageBytes, boundsErr := mappingPageBytes(span)
+					if boundsErr != nil || pageBytes > lookaheadBytes-queuedBytes {
+						break
+					}
+					next, prepareErr := prepare(nextFirst)
+					err = prepareErr
+					if err != nil {
+						return err
+					}
+					queue = append(queue, next)
+					queuedBytes += pageBytes
+					nextFirst = next.end
 				}
 			}
 			for _, item := range selected[current.first:current.end] {
@@ -421,48 +554,40 @@ func (r *Reader) WithExpertRanges(ranges []ggufindex.Range, fn func(index int, d
 	}()
 }
 
-func (r *Reader) mapExpertRun(f *os.File, span ggufindex.Range, hot bool) ([]byte, func() error, error) {
+func (r *Reader) mapExpertRun(f *os.File, span ggufindex.Range, hot bool, frequency uint64) ([]byte, func() error, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	pageSize := uint64(os.Getpagesize())
-	prefix := span.Start % pageSize
-	if mapped := r.expertCache[span]; mapped != nil {
-		r.expertStats.CacheHits++
-		return mapped[int(prefix):len(mapped):len(mapped)], func() error { return nil }, nil
+	if data, release, ok, err := r.residentLeaseLocked(span); ok || err != nil {
+		return data, release, err
 	}
-	mapped, prefix, err := mmapFileRange(f, span)
+	if entry := r.expertCache[span]; entry != nil {
+		r.expertStats.CacheHits++
+		entry.frequency = increment(entry.frequency)
+		entry.lastUse = r.cacheClock
+		data, release := r.leaseLocked(entry, span)
+		return data, release, nil
+	}
+	entry, err := r.newEntryLocked(f, span, false)
 	if err != nil {
 		return nil, nil, err
 	}
-	_ = syscall.Madvise(mapped, syscall.MADV_RANDOM)
-	// A single large WILLNEED can cover only the beginning of an expert.
-	// Keep every hint page-aligned and inside this selected run's mapping.
-	step := max(DefaultExpertPrefetchBytes, os.Getpagesize())
-	for offset := 0; offset < len(mapped); {
-		end := offset + min(step, len(mapped)-offset)
-		r.expertStats.PrefetchCalls++
-		if err := syscall.Madvise(mapped[offset:end], syscall.MADV_WILLNEED); err != nil {
-			r.expertStats.PrefetchFailures++
-		}
-		offset = end
-	}
-	pageBytes := (uint64(len(mapped)) + pageSize - 1) / pageSize * pageSize
+	r.prefetchLocked(entry.mapped)
 	r.expertStats.MappedRuns++
 	r.expertStats.MappedBytes += span.End - span.Start
-	r.expertStats.MappedPageBytes += pageBytes
-	release := func() error { return syscall.Munmap(mapped) }
-	if hot && pageBytes <= r.expertOptions.MaxBytes-r.expertStats.CachedBytes {
-		if err := syscall.Mlock(mapped); err != nil {
-			r.expertStats.LockFailures++
+	r.expertStats.MappedPageBytes += entry.pageBytes
+	entry.frequency = max(1, frequency)
+	entry.lastUse = r.cacheClock
+	if hot && !r.closed {
+		room, roomErr := r.makeRoomLocked(entry.pageBytes, entry.frequency)
+		if roomErr != nil {
+			return nil, nil, errors.Join(roomErr, r.releaseEntryLocked(entry))
+		}
+		if room {
+			r.retainLocked(entry)
 		} else {
-			if r.expertCache == nil {
-				r.expertCache = make(map[ggufindex.Range][]byte)
-			}
-			r.expertCache[span] = mapped
-			r.expertStats.CachedRuns++
-			r.expertStats.CachedBytes += pageBytes
-			release = func() error { return nil }
+			r.expertStats.AdmissionFailures++
 		}
 	}
-	return mapped[int(prefix):len(mapped):len(mapped)], release, nil
+	data, release := r.leaseLocked(entry, span)
+	return data, release, nil
 }

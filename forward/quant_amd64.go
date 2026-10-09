@@ -8,6 +8,44 @@ import (
 	"simd/archsimd"
 )
 
+func init() {
+	if archsimd.X86.AVX2() && archsimd.X86.FMA() && !simd.Emulated() {
+		quantDotQ80Pair = quantQ80PairAVX2
+	}
+}
+
+// Keep each row's four accumulation chains and final reduction unchanged.
+// Each activation vector feeds both rows without rounding the activations.
+func quantQ80PairAVX2(rows []byte, x []float32) (float32, float32) {
+	rowBytes := len(x) / q80Elements * q80BlockBytes
+	r0, r1 := rows[:rowBytes], rows[rowBytes:2*rowBytes]
+	var a0, a1, a2, a3, b0, b1, b2, b3 archsimd.Float32x8
+	for block := 0; block < rowBytes/q80BlockBytes; block++ {
+		e0 := (*[q80BlockBytes]byte)(r0[block*q80BlockBytes:])
+		e1 := (*[q80BlockBytes]byte)(r1[block*q80BlockBytes:])
+		s0 := archsimd.BroadcastUint32x8(quantFloat16Bits(binary.LittleEndian.Uint16(e0[:]))).AsFloat32x8()
+		s1 := archsimd.BroadcastUint32x8(quantFloat16Bits(binary.LittleEndian.Uint16(e1[:]))).AsFloat32x8()
+		input := (*[32]float32)(x[block*32:])
+		p0 := archsimd.LoadUint8x16(e0[2:18])
+		p1 := archsimd.LoadUint8x16(e1[2:18])
+		v := archsimd.LoadFloat32x8(input[:8])
+		a0 = p0.AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(s0).MulAdd(v, a0)
+		b0 = p1.AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(s1).MulAdd(v, b0)
+		v = archsimd.LoadFloat32x8(input[8:16])
+		a1 = p0.ConcatShiftBytesRight(p0, 8).AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(s0).MulAdd(v, a1)
+		b1 = p1.ConcatShiftBytesRight(p1, 8).AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(s1).MulAdd(v, b1)
+		p0 = archsimd.LoadUint8x16(e0[18:])
+		p1 = archsimd.LoadUint8x16(e1[18:])
+		v = archsimd.LoadFloat32x8(input[16:24])
+		a2 = p0.AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(s0).MulAdd(v, a2)
+		b2 = p1.AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(s1).MulAdd(v, b2)
+		v = archsimd.LoadFloat32x8(input[24:])
+		a3 = p0.ConcatShiftBytesRight(p0, 8).AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(s0).MulAdd(v, a3)
+		b3 = p1.ConcatShiftBytesRight(p1, 8).AsInt8x16().ExtendLo8ToInt32().ConvertToFloat32().Mul(s1).MulAdd(v, b3)
+	}
+	return quantSumAVX2(a0.Add(a1).Add(a2).Add(a3)), quantSumAVX2(b0.Add(b1).Add(b2).Add(b3))
+}
+
 func quantDotQ40(row []byte, x []float32) float32 {
 	if archsimd.X86.AVX2() && archsimd.X86.FMA() && !simd.Emulated() {
 		return quantQ40AVX2(row, x)

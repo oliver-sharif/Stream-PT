@@ -86,7 +86,7 @@ func TestIndexOptimizationFixedArrays(t *testing.T) {
 }
 
 func TestIndexOptimizationVariableArrays(t *testing.T) {
-	stringsValue := indexOptimizationArray(8, 3, append(append(indexOptimizationString(""), indexOptimizationString("hello")...), indexOptimizationString("ä")...))
+	stringsValue := indexOptimizationArray(8, 3, append(append(indexOptimizationString(""), indexOptimizationString("hello")...), indexOptimizationString("\u00e4")...))
 	fixedValue := indexOptimizationArray(2, 2, []byte{1, 0, 2, 0})
 	nestedValue := indexOptimizationArray(9, 3, append(append(append([]byte(nil), stringsValue...), fixedValue...), indexOptimizationArray(9, 0, nil)...))
 	for _, tc := range []struct {
@@ -94,8 +94,8 @@ func TestIndexOptimizationVariableArrays(t *testing.T) {
 		value []byte
 		json  string
 	}{
-		{"strings", stringsValue, `["","hello","ä"]`},
-		{"nested", nestedValue, `[["","hello","ä"],[1,2],[]]`},
+		{"strings", stringsValue, "[\"\",\"hello\",\"\u00e4\"]"},
+		{"nested", nestedValue, "[[\"\",\"hello\",\"\u00e4\"],[1,2],[]]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path, data := indexOptimizationFixture(t, indexOptimizationEntry{key: "array", typ: 9, value: tc.value})
