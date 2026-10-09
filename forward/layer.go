@@ -229,12 +229,51 @@ func addBias(reader *ggufmmap.Reader, biasTensor ggufindex.Tensor, dst []float32
 		}
 		return fmt.Errorf("%q: invalid bias range", biasTensor.Name)
 	}
-	bias := make([]float32, len(dst))
-	if err := readFloatVector(reader, biasTensor, bias); err != nil {
-		return err
+	width := 4
+	if biasTensor.Type == 1 || biasTensor.Type == 30 {
+		width = 2
+	} else if biasTensor.Type != 0 {
+		return fmt.Errorf("%q: unsupported float tensor type %d", biasTensor.Name, biasTensor.Type)
 	}
-	addVector(dst, bias)
-	return nil
+	if len(biasTensor.Shape) != 1 || biasTensor.Shape[0] != uint64(len(dst)) ||
+		biasTensor.Range.End < biasTensor.Range.Start || biasTensor.Range.End-biasTensor.Range.Start != uint64(width*len(dst)) {
+		return fmt.Errorf("%q: invalid float vector shape or range", biasTensor.Name)
+	}
+	return reader.WithTensor(biasTensor, func(data []byte) error {
+		var vec simd.Float32s
+		lanes := vec.Len()
+		var temp [32]float32
+		if biasTensor.Type == 0 {
+			for offset := 0; offset < len(dst); offset += lanes {
+				end := min(offset+lanes, len(dst))
+				count := end - offset
+				for i := 0; i < count; i++ {
+					temp[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[(offset+i)*4:]))
+				}
+				if count == lanes {
+					d := simd.LoadFloat32s(dst[offset:end])
+					b := simd.LoadFloat32s(temp[:lanes])
+					d.Add(b).Store(dst[offset:end])
+				} else {
+					d, _ := simd.LoadFloat32sPart(dst[offset:end])
+					b, _ := simd.LoadFloat32sPart(temp[:count])
+					d.Add(b).StorePart(dst[offset:end])
+				}
+			}
+			return nil
+		}
+		for i := range dst {
+			var b float32
+			switch biasTensor.Type {
+			case 1:
+				b = float16(binary.LittleEndian.Uint16(data[i*2:]))
+			case 30:
+				b = math.Float32frombits(uint32(binary.LittleEndian.Uint16(data[i*2:])) << 16)
+			}
+			dst[i] += b
+		}
+		return nil
+	})
 }
 
 func readFloatVector(reader *ggufmmap.Reader, tensor ggufindex.Tensor, dst []float32) error {
@@ -267,7 +306,24 @@ func addVector(dst, src []float32) {
 	var vec simd.Float32s
 	lanes := vec.Len()
 	n := min(len(dst), len(src))
-	for offset := 0; offset < n; offset += lanes {
+	offset := 0
+	for ; offset+4*lanes <= n; offset += 4 * lanes {
+		d0 := simd.LoadFloat32s(dst[offset : offset+lanes])
+		d1 := simd.LoadFloat32s(dst[offset+lanes : offset+2*lanes])
+		d2 := simd.LoadFloat32s(dst[offset+2*lanes : offset+3*lanes])
+		d3 := simd.LoadFloat32s(dst[offset+3*lanes : offset+4*lanes])
+
+		s0 := simd.LoadFloat32s(src[offset : offset+lanes])
+		s1 := simd.LoadFloat32s(src[offset+lanes : offset+2*lanes])
+		s2 := simd.LoadFloat32s(src[offset+2*lanes : offset+3*lanes])
+		s3 := simd.LoadFloat32s(src[offset+3*lanes : offset+4*lanes])
+
+		d0.Add(s0).Store(dst[offset : offset+lanes])
+		d1.Add(s1).Store(dst[offset+lanes : offset+2*lanes])
+		d2.Add(s2).Store(dst[offset+2*lanes : offset+3*lanes])
+		d3.Add(s3).Store(dst[offset+3*lanes : offset+4*lanes])
+	}
+	for ; offset < n; offset += lanes {
 		end := min(offset+lanes, n)
 		if end-offset == lanes {
 			d := simd.LoadFloat32s(dst[offset:end])

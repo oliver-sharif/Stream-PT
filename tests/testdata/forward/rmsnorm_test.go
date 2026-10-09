@@ -239,3 +239,44 @@ func encodeUint16(values []uint16) []byte {
 	}
 	return data
 }
+
+func BenchmarkRMSNorm(b *testing.B) {
+	for _, dim := range []int{2880, 4096} {
+		b.Run(filepath.Base(b.Name())+"/"+string(rune(dim)), func(b *testing.B) {
+			path := filepath.Join(b.TempDir(), "weights.bin")
+			raw := make([]byte, dim*4)
+			for i := 0; i < dim; i++ {
+				binary.LittleEndian.PutUint32(raw[i*4:], math.Float32bits(1.0+float32(i%10)/10))
+			}
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				b.Fatal(err)
+			}
+			tensor := ggufindex.Tensor{
+				Name:  "norm.weight",
+				Type:  0,
+				Shape: []uint64{uint64(dim)},
+				Range: ggufindex.Range{File: path, End: uint64(len(raw))},
+			}
+			reader, err := ggufmmap.Open(&ggufindex.Model{Paths: []string{path}})
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer reader.Close()
+
+			x := make([]float32, dim)
+			y := make([]float32, dim)
+			for i := range x {
+				x[i] = float32(i%23-11) / 8
+			}
+			ctx := context.Background()
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				if err := RMSNormInto(ctx, reader, tensor, x, y, 1e-5); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

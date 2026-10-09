@@ -24,9 +24,16 @@ func ApplyRoPE(
 	}
 	halfDim := headDim / 2
 
-	// Precompute cos and sin for this position.
-	cosTable := make([]float32, halfDim)
-	sinTable := make([]float32, halfDim)
+	// Precompute cos and sin for this position using stack buffer to avoid allocations.
+	var cosTable, sinTable []float32
+	var cosStack, sinStack [64]float32
+	if halfDim <= len(cosStack) {
+		cosTable = cosStack[:halfDim]
+		sinTable = sinStack[:halfDim]
+	} else {
+		cosTable = make([]float32, halfDim)
+		sinTable = make([]float32, halfDim)
+	}
 	scaling, concentration := 1.0, 1.0
 	var low, high float64
 	if len(options) > 0 && options[0].ScalingFactor > 1 {

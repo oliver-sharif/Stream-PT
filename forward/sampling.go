@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
-	"sort"
+	"slices"
 )
 
 // SamplingOptions follows llama.cpp's penalties -> top-k -> top-p -> min-p ->
@@ -105,7 +105,70 @@ func (s *tokenSampler) penalize(id int, logit float64) float64 {
 	return logit
 }
 
+func compareTokenCandidates(a, b tokenCandidate) int {
+	if a.logit > b.logit {
+		return -1
+	}
+	if a.logit < b.logit {
+		return 1
+	}
+	if a.id < b.id {
+		return -1
+	}
+	if a.id > b.id {
+		return 1
+	}
+	return 0
+}
+
+func selectTopKCandidates(c []tokenCandidate, k int) {
+	if k <= 0 || k >= len(c) {
+		return
+	}
+	left, right := 0, len(c)-1
+	for left < right {
+		pivotIdx := left + (right-left)/2
+		pivot := c[pivotIdx]
+		// Partition
+		c[pivotIdx], c[right] = c[right], c[pivotIdx]
+		storeIdx := left
+		for i := left; i < right; i++ {
+			if compareTokenCandidates(c[i], pivot) < 0 {
+				c[i], c[storeIdx] = c[storeIdx], c[i]
+				storeIdx++
+			}
+		}
+		c[storeIdx], c[right] = c[right], c[storeIdx]
+		if storeIdx == k {
+			break
+		} else if storeIdx < k {
+			left = storeIdx + 1
+		} else {
+			right = storeIdx - 1
+		}
+	}
+}
+
 func (s *tokenSampler) sample(logits []float32) (int, error) {
+	if s.options.Temperature == 0 {
+		bestID := -1
+		bestLogit := float64(math.Inf(-1))
+		for id, logit := range logits {
+			value := s.penalize(id, float64(logit))
+			if math.IsNaN(value) || math.IsInf(value, 1) {
+				return 0, fmt.Errorf("invalid logit for token %d", id)
+			}
+			if value > bestLogit || (value == bestLogit && (bestID < 0 || id < bestID)) {
+				bestID = id
+				bestLogit = value
+			}
+		}
+		if bestID < 0 || math.IsInf(bestLogit, -1) {
+			return 0, fmt.Errorf("no finite token candidates")
+		}
+		return bestID, nil
+	}
+
 	s.candidates = s.candidates[:0]
 	for id, logit := range logits {
 		value := s.penalize(id, float64(logit))
@@ -120,20 +183,11 @@ func (s *tokenSampler) sample(logits []float32) (int, error) {
 		return 0, fmt.Errorf("no finite token candidates")
 	}
 	c := s.candidates
-	sort.Slice(c, func(i, j int) bool {
-		if c[i].logit == c[j].logit {
-			return c[i].id < c[j].id
-		}
-		return c[i].logit > c[j].logit
-	})
-	// At zero temperature llama.cpp ultimately selects the highest remaining
-	// logit; the probability filters always retain that candidate.
-	if s.options.Temperature == 0 {
-		return c[0].id, nil
-	}
 	if k := s.options.TopK; k > 0 && k < len(c) {
+		selectTopKCandidates(c, k)
 		c = c[:k]
 	}
+	slices.SortFunc(c, compareTokenCandidates)
 	if s.options.TopP < 1 {
 		softmaxCandidates(c, 1)
 		cumulative := 0.0

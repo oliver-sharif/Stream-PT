@@ -299,3 +299,42 @@ func TestGenerateSamplingBatchAndSequentialAgree(t *testing.T) {
 		t.Fatalf("batch/sequential = %v/%v", got, want)
 	}
 }
+
+func BenchmarkSamplingLargeVocab(b *testing.B) {
+	const vocabSize = 128000
+	logits := make([]float32, vocabSize)
+	for i := range logits {
+		logits[i] = float32(i%1000 - 500)
+	}
+	opts := DefaultSamplingOptions()
+	s, err := newTokenSampler(opts, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.Run("default_temp0.8_topk40", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if _, err := s.sample(logits); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+
+	b.Run("greedy_temp0", func(b *testing.B) {
+		greedyOpts := opts
+		greedyOpts.Temperature = 0
+		greedySampler, err := newTokenSampler(greedyOpts, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			if _, err := greedySampler.sample(logits); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

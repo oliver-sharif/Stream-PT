@@ -1120,13 +1120,22 @@ const indexHTML = `<!DOCTYPE html>
       let fullReasoning = '';
       let finalPerformance = null;
       let generatedTokens = 0;
+      let tokenGenerationStartTime = null;
       const startTime = performance.now();
       tokenCounter.textContent = 'Generating (max ' + settings.maxTokens + ' tokens)...';
-      const progressTimer = setInterval(() => {
+
+      const updateProgressDisplay = () => {
         const elapsedSec = (performance.now() - startTime) / 1000;
-        const speed = elapsedSec > 0 ? (generatedTokens / elapsedSec).toFixed(1) : '0';
-        tokenCounter.textContent = generatedTokens + ' / ' + settings.maxTokens + ' tokens (' + speed + ' T/s, ' + elapsedSec.toFixed(1) + 's)';
-      }, 250);
+        if (tokenGenerationStartTime !== null && generatedTokens > 0) {
+          const genElapsed = (performance.now() - tokenGenerationStartTime) / 1000;
+          const speed = genElapsed > 0 ? (generatedTokens / genElapsed).toFixed(1) : '0';
+          tokenCounter.textContent = generatedTokens + ' / ' + settings.maxTokens + ' tokens (' + speed + ' T/s, ' + elapsedSec.toFixed(1) + 's)';
+        } else {
+          tokenCounter.textContent = '0 / ' + settings.maxTokens + ' tokens (' + elapsedSec.toFixed(1) + 's)';
+        }
+      };
+
+      const progressTimer = setInterval(updateProgressDisplay, 250);
 
       const outgoingMessages = [];
       if (settings.systemPrompt && settings.systemPrompt.trim()) {
@@ -1172,17 +1181,29 @@ const indexHTML = `<!DOCTYPE html>
             if (payload === '[DONE]') break;
             try {
               const event = JSON.parse(payload);
-              if (!event.done && !event.error) generatedTokens++;
-              if (event.generated_tokens !== undefined) generatedTokens = event.generated_tokens;
+              if (!event.done && !event.error) {
+                if (tokenGenerationStartTime === null) {
+                  tokenGenerationStartTime = performance.now();
+                }
+                generatedTokens++;
+              }
+              if (event.generated_tokens !== undefined) {
+                generatedTokens = event.generated_tokens;
+                if (generatedTokens > 0 && tokenGenerationStartTime === null) {
+                  tokenGenerationStartTime = performance.now();
+                }
+              }
               if (event.reasoning !== undefined) {
                 fullReasoning += event.reasoning;
                 reasoningContent.textContent = fullReasoning;
                 reasoningSummary.textContent = 'Thinking …';
                 statusText.textContent = 'Thinking …';
                 chatContainer.scrollTop = chatContainer.scrollHeight;
+                updateProgressDisplay();
               } else if (!event.done && !event.error && !event.text && !fullResponse && !fullReasoning) {
                 reasoningSummary.textContent = 'Generation in progress …';
                 statusText.textContent = 'Generation in progress …';
+                updateProgressDisplay();
               }
               if (event.error) {
                 fullResponse += '\n[Error: ' + event.error + ']';
@@ -1195,9 +1216,7 @@ const indexHTML = `<!DOCTYPE html>
                 assistantBubble.textContent = fullResponse;
                 assistantBubble.appendChild(cursor);
                 chatContainer.scrollTop = chatContainer.scrollHeight;
-                const elapsedSec = (performance.now() - startTime) / 1000;
-                const speed = elapsedSec > 0 ? (generatedTokens / elapsedSec).toFixed(1) : '0';
-                tokenCounter.textContent = generatedTokens + ' / ' + settings.maxTokens + ' tokens (' + speed + ' T/s)';
+                updateProgressDisplay();
               }
               if (event.done) {
                 finalPerformance = event.performance || null;

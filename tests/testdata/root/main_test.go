@@ -72,7 +72,7 @@ func TestChatServerIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := buf.String()
-	for _, expected := range []string{"Stream-PT", "/api/chat", "/api/info", "max-tokens-slider", "system-prompt-input", "settings-modal", "temperature-slider", "temperature-input", "repeat-penalty-input", "temperature: settings.temperature", "repeat_penalty: settings.repeatPenalty"} {
+	for _, expected := range []string{"Stream-PT", "/api/chat", "/api/info", "max-tokens-slider", "system-prompt-input", "settings-modal", "temperature-slider", "temperature-input", "repeat-penalty-input", "temperature: settings.temperature", "repeat_penalty: settings.repeatPenalty", "tokenGenerationStartTime", "updateProgressDisplay"} {
 		if !strings.Contains(body, expected) {
 			t.Errorf("Index HTML missing %q", expected)
 		}

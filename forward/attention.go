@@ -133,23 +133,27 @@ func forwardAttention(
 
 		// Weighted sum of V
 		outHead := out[h*headDim : (h+1)*headDim]
-		clear(outHead)
+		var outAcc [32]simd.Float32s
 		for p := startPos; p <= pos && p < cache.MaxPos; p++ {
 			vHead := cache.Values[layer][p][kvHead*headDim : (kvHead+1)*headDim]
 			sVec := simd.BroadcastFloat32s(scores[p] * invSum)
-			for offset := 0; offset < headDim; offset += lanes {
+			for vIdx, offset := 0, 0; offset < headDim; vIdx, offset = vIdx+1, offset+lanes {
 				end := min(offset+lanes, headDim)
 				if end-offset == lanes {
 					vPart := simd.LoadFloat32s(vHead[offset:end])
-					outPart := simd.LoadFloat32s(outHead[offset:end])
-					res := vPart.MulAdd(sVec, outPart)
-					res.Store(outHead[offset:end])
+					outAcc[vIdx] = vPart.MulAdd(sVec, outAcc[vIdx])
 				} else {
 					vPart, _ := simd.LoadFloat32sPart(vHead[offset:end])
-					outPart, _ := simd.LoadFloat32sPart(outHead[offset:end])
-					res := vPart.MulAdd(sVec, outPart)
-					res.StorePart(outHead[offset:end])
+					outAcc[vIdx] = vPart.MulAdd(sVec, outAcc[vIdx])
 				}
+			}
+		}
+		for vIdx, offset := 0, 0; offset < headDim; vIdx, offset = vIdx+1, offset+lanes {
+			end := min(offset+lanes, headDim)
+			if end-offset == lanes {
+				outAcc[vIdx].Store(outHead[offset:end])
+			} else {
+				outAcc[vIdx].StorePart(outHead[offset:end])
 			}
 		}
 	}
